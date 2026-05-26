@@ -1,13 +1,15 @@
 {
   "name": "@hyperttp/transport-bun",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "High-performance, extensible HTTP client for Bun",
   "type": "module",
   "exports": {
     ".": {
       "types": "./dist/index.d.ts",
-      "import": "./dist/index.js"
-    }
+      "import": "./dist/index.js",
+      "require": "./dist/index.js"
+    },
+    "./package.json": "./dist/package.json"
   },
   "files": [
     "dist"
