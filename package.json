@@ -1,6 +1,6 @@
 {
   "name": "@hyperttp/transport-bun",
-  "version": "0.1.1",
+  "version": "0.1.5",
   "description": "High-performance, extensible HTTP client for Bun",
   "type": "module",
   "exports": {
@@ -28,13 +28,7 @@
     "url": "git+https://github.com/IT-IF-OR/hyperttp-transport-bun.git"
   },
   "peerDependencies": {
-    "typescript": "^6",
-    "@hyperttp/types": "^0.1.1"
-  },
-  "peerDependenciesMeta": {
-    "typescript": {
-      "optional": true
-    }
+    "@hyperttp/types": "^0.1.5"
   },
   "devDependencies": {
     "@dirold2/dev-tools": "^1.0.16",

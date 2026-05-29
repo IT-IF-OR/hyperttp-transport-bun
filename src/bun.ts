@@ -109,6 +109,13 @@ class BunTransportResponse implements TransportResponse {
     return body;
   }
 
+  async dump(): Promise<void> {
+    const body = this._nativeResponse.body;
+    if (body) {
+      await fastStreamDump.call(body);
+    }
+  }
+
   async text(): Promise<string> {
     if (this._cachedText !== null) return this._cachedText;
     this._cachedText = await this._nativeResponse.text();
@@ -224,16 +231,15 @@ export class BunTransport implements HyperTransport {
 
   private prepareHeaders(req: TransportRequest): Record<string, string> {
     const original = req.headers as Record<string, string | string[]>;
+    const headers: Record<string, string> = {};
 
-    const headers: Record<string, string> = Object.fromEntries(
-      Object.entries(original).map(([key, value]) => [
-        key,
-        normalizeHeaderValue(key, value),
-      ]),
-    );
+    for (const key in original) {
+      if (Object.prototype.hasOwnProperty.call(original, key)) {
+        headers[key] = normalizeHeaderValue(key, original[key]!);
+      }
+    }
 
     const ua = this._userAgent;
-
     if (ua && !headers["User-Agent"] && !headers["user-agent"]) {
       headers["User-Agent"] = ua;
     }
@@ -252,13 +258,12 @@ export class BunTransport implements HyperTransport {
     const savedCookies = this.getCookiesForDomain(domain);
     const hasSavedCookies = savedCookies.length > 0;
 
-    const cookieParts: string[] = [];
-
-    if (hasUserCookie) cookieParts.push(userCookie);
-    if (hasSavedCookies) cookieParts.push(savedCookies);
-
-    if (cookieParts.length > 0) {
-      headers["Cookie"] = cookieParts.join("; ");
+    if (hasUserCookie && hasSavedCookies) {
+      headers["Cookie"] = `${userCookie}; ${savedCookies}`;
+    } else if (hasUserCookie) {
+      headers["Cookie"] = userCookie;
+    } else if (hasSavedCookies) {
+      headers["Cookie"] = savedCookies;
     }
 
     return headers;
