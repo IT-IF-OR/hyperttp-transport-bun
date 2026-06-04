@@ -5,7 +5,6 @@ import type {
   TransportResponse,
   TransportResponsePayload,
 } from "@hyperttp/types";
-import type { BodyInit } from "bun";
 
 export function fastGetHostname(url: string): string {
   if (!url) return "localhost";
@@ -30,15 +29,6 @@ export function fastGetHostname(url: string): string {
   return url.slice(start, end) || "localhost";
 }
 
-export async function fastStreamDump(this: ReadableStream<Uint8Array>) {
-  if (this.locked) return;
-  try {
-    await new Response(this).arrayBuffer();
-  } catch {
-    //
-  }
-}
-
 export function getAbortError(signal?: AbortSignal): unknown {
   return (
     signal?.reason ??
@@ -48,12 +38,6 @@ export function getAbortError(signal?: AbortSignal): unknown {
 
 export function throwIfAborted(signal?: AbortSignal): void {
   if (!signal) return;
-
-  if (typeof signal.throwIfAborted === "function") {
-    signal.throwIfAborted();
-    return;
-  }
-
   if (signal.aborted) {
     throw getAbortError(signal);
   }
@@ -71,71 +55,11 @@ export function normalizeHeaderValue(
   value: string | string[],
 ): string {
   if (Array.isArray(value)) {
-    const lower = name.toLowerCase();
-
-    if (lower === "cookie") {
-      return value.join("; ");
-    }
-
-    return value.join(", ");
+    return name.toLowerCase() === "cookie"
+      ? value.join("; ")
+      : value.join(", ");
   }
-
   return value;
-}
-
-class BunTransportResponse implements TransportResponse {
-  private _nativeResponse: Response;
-  private _cachedText: string | null = null;
-  private _cachedJson: unknown = null;
-  private _cachedHeaders: Record<string, string | string[]> | null = null;
-
-  constructor(nativeResponse: Response) {
-    this._nativeResponse = nativeResponse;
-  }
-
-  get status(): number {
-    return this._nativeResponse.status;
-  }
-
-  get url(): string {
-    return this._nativeResponse.url;
-  }
-
-  get body() {
-    const body = this._nativeResponse.body as TransportResponsePayload;
-    if (body && body.dump === undefined) {
-      body.dump = fastStreamDump;
-    }
-    return body;
-  }
-
-  async dump(): Promise<void> {
-    const body = this._nativeResponse.body;
-    if (body) {
-      await fastStreamDump.call(body);
-    }
-  }
-
-  async text(): Promise<string> {
-    if (this._cachedText !== null) return this._cachedText;
-    this._cachedText = await this._nativeResponse.text();
-    return this._cachedText;
-  }
-
-  async json<T = unknown>(): Promise<T> {
-    return (
-      this._cachedJson ?? (this._cachedJson = await this._nativeResponse.json())
-    );
-  }
-
-  get headers(): Record<string, string | string[]> {
-    if (this._cachedHeaders === null) {
-      const rawHeaders = this._nativeResponse.headers;
-      this._cachedHeaders =
-        rawHeaders.toJSON?.() || Object.fromEntries(rawHeaders.entries());
-    }
-    return this._cachedHeaders!;
-  }
 }
 
 export class BunTransport implements HyperTransport {
@@ -170,7 +94,6 @@ export class BunTransport implements HyperTransport {
 
   public async execute(req: TransportRequest): Promise<TransportResponse> {
     const maxConcurrent = this._maxConcurrent;
-
     let signal = req.signal;
     const timeoutMs = this._timeout;
 
@@ -181,7 +104,7 @@ export class BunTransport implements HyperTransport {
         : timeoutSignal;
     }
 
-    throwIfAborted(signal);
+    if (signal?.aborted) throw getAbortError(signal);
 
     if (maxConcurrent > 0 && this.activeRequests >= maxConcurrent) {
       await new Promise<void>((resolve, reject) => {
@@ -198,11 +121,11 @@ export class BunTransport implements HyperTransport {
       });
     }
 
-    throwIfAborted(signal);
+    if (signal?.aborted) throw getAbortError(signal);
     this.activeRequests++;
 
     try {
-      const response = await fetch(req.url, {
+      const nativeRes = await fetch(req.url, {
         method: req.method,
         headers: this.prepareHeaders(req),
         body: req.body as BodyInit | null,
@@ -212,17 +135,41 @@ export class BunTransport implements HyperTransport {
         tls: this._tlsConfig,
       });
 
-      if (response.headers.has("set-cookie")) {
-        const setCookies = response.headers.getSetCookie();
+      if (this.hasCookies || nativeRes.headers.has("set-cookie")) {
+        const setCookies = nativeRes.headers.getSetCookie();
         if (setCookies?.length) {
           this.updateCookies(fastGetHostname(req.url), setCookies);
         }
       }
 
-      return new BunTransportResponse(response);
+      const rawBody = nativeRes.body ?? new ReadableStream<Uint8Array>();
+
+      const bodyPayload = rawBody as unknown as TransportResponsePayload;
+      bodyPayload!.dump = async function (): Promise<void> {
+        return rawBody.cancel().catch(() => {});
+      };
+
+      const headersObj: Record<string, string> = {};
+      nativeRes.headers.forEach((value, key) => {
+        const first = key.charCodeAt(0);
+        if (first === 99 || first === 67) {
+          const lower = key.toLowerCase();
+          if (lower === "content-encoding" || lower === "content-length") {
+            return;
+          }
+        }
+        headersObj[key] = value;
+      });
+
+      return {
+        status: nativeRes.status,
+        headers: headersObj,
+        url: nativeRes.url,
+        body: bodyPayload,
+      };
     } finally {
       this.activeRequests--;
-      if (maxConcurrent > 0) {
+      if (maxConcurrent > 0 && this.concurrencyQueue.length > 0) {
         const nextResolver = this.concurrencyQueue.shift();
         if (nextResolver) nextResolver();
       }
