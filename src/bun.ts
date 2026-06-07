@@ -6,27 +6,80 @@ import type {
   TransportResponsePayload,
 } from "@hyperttp/types";
 
+type BunRequestInit = RequestInit & {
+  tls?: {
+    rejectUnauthorized: boolean;
+  };
+};
+
+type BunHeaders = Headers & {
+  getSetCookie?: () => string[];
+};
+
+const hostnameCache = new Map<string, string>();
+
+async function streamDump(this: ReadableStream): Promise<void> {
+  return this.cancel().catch(() => {});
+}
+
+function attachDump(
+  stream: ReadableStream<Uint8Array>,
+): TransportResponsePayload {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  (stream as any).dump = streamDump;
+  return stream as unknown as TransportResponsePayload;
+}
+
 export function fastGetHostname(url: string): string {
   if (!url) return "localhost";
-  if (url.charCodeAt(0) === 47) return "localhost";
 
-  let start = url.indexOf("//");
-  if (start === -1) {
-    start = 0;
+  const cached = hostnameCache.get(url);
+  if (cached) return cached;
+
+  let start = 0;
+
+  if (url.charCodeAt(0) === 47) {
+    if (url.charCodeAt(1) === 47) {
+      start = 2;
+    } else {
+      hostnameCache.set(url, "localhost");
+      return "localhost";
+    }
   } else {
-    start += 2;
+    const schemeIdx = url.indexOf("://");
+    if (schemeIdx !== -1) {
+      start = schemeIdx + 3;
+    }
   }
 
-  let end = url.indexOf("/", start);
-  if (end === -1) end = url.indexOf("?", start);
-  if (end === -1) end = url.length;
+  let end = url.length;
 
-  const portIdx = url.indexOf(":", start);
-  if (portIdx !== -1 && portIdx < end) {
-    end = portIdx;
+  for (let i = start; i < url.length; i++) {
+    const code = url.charCodeAt(i);
+    if (code === 47 || code === 63 || code === 35) {
+      end = i;
+      break;
+    }
   }
 
-  return url.slice(start, end) || "localhost";
+  const atIdx = url.indexOf("@", start);
+  if (atIdx !== -1 && atIdx < end) {
+    start = atIdx + 1;
+  }
+
+  const colonIdx = url.indexOf(":", start);
+  if (colonIdx !== -1 && colonIdx < end) {
+    end = colonIdx;
+  }
+
+  const host = url.slice(start, end) || "localhost";
+
+  if (hostnameCache.size > 512) {
+    hostnameCache.clear();
+  }
+
+  hostnameCache.set(url, host);
+  return host;
 }
 
 export function getAbortError(signal?: AbortSignal): unknown {
@@ -36,40 +89,16 @@ export function getAbortError(signal?: AbortSignal): unknown {
   );
 }
 
-export function throwIfAborted(signal?: AbortSignal): void {
-  if (!signal) return;
-  if (signal.aborted) {
-    throw getAbortError(signal);
-  }
-}
-
-export function normalizeCookieHeader(
-  value: string | string[] | undefined,
-): string {
-  if (value === undefined) return "";
-  return Array.isArray(value) ? value.join("; ") : String(value).trim();
-}
-
-export function normalizeHeaderValue(
-  name: string,
-  value: string | string[],
-): string {
-  if (Array.isArray(value)) {
-    return name.toLowerCase() === "cookie"
-      ? value.join("; ")
-      : value.join(", ");
-  }
-  return value;
-}
-
 export class BunTransport implements HyperTransport {
   public config: HttpClientOptions;
 
-  private cookieJar = new Map<string, Map<string, string>>();
-  private cookieCache = new Map<string, string>();
+  private readonly cookieJar = new Map<string, Map<string, string>>();
+  private readonly cookieCache = new Map<string, string>();
 
   private activeRequests = 0;
-  private concurrencyQueue: (() => void)[] = [];
+  private readonly concurrencyQueue: Array<() => void> = [];
+  private queueHead = 0;
+
   private hasCookies = false;
 
   private _maxConcurrent = 0;
@@ -83,7 +112,7 @@ export class BunTransport implements HyperTransport {
     this.invalidateConfig();
   }
 
-  private invalidateConfig() {
+  private invalidateConfig(): void {
     const net = this.config.network;
     this._maxConcurrent = net?.maxConcurrent ?? 0;
     this._timeout = net?.timeout ?? 0;
@@ -94,8 +123,8 @@ export class BunTransport implements HyperTransport {
 
   public async execute(req: TransportRequest): Promise<TransportResponse> {
     const maxConcurrent = this._maxConcurrent;
-    let signal = req.signal;
     const timeoutMs = this._timeout;
+    let signal = req.signal;
 
     if (timeoutMs > 0) {
       const timeoutSignal = AbortSignal.timeout(timeoutMs);
@@ -107,25 +136,15 @@ export class BunTransport implements HyperTransport {
     if (signal?.aborted) throw getAbortError(signal);
 
     if (maxConcurrent > 0 && this.activeRequests >= maxConcurrent) {
-      await new Promise<void>((resolve, reject) => {
-        const onAbort = () => {
-          signal?.removeEventListener("abort", onAbort);
-          reject(getAbortError(signal));
-        };
-
-        signal?.addEventListener("abort", onAbort, { once: true });
-        this.concurrencyQueue.push(() => {
-          signal?.removeEventListener("abort", onAbort);
-          resolve();
-        });
-      });
+      await this.waitForSlot(signal);
     }
 
     if (signal?.aborted) throw getAbortError(signal);
+
     this.activeRequests++;
 
     try {
-      const nativeRes = await fetch(req.url, {
+      const init: BunRequestInit = {
         method: req.method,
         headers: this.prepareHeaders(req),
         body: req.body as BodyInit | null,
@@ -133,70 +152,109 @@ export class BunTransport implements HyperTransport {
         keepalive: this._keepalive,
         redirect: "manual",
         tls: this._tlsConfig,
-      });
-
-      if (this.hasCookies || nativeRes.headers.has("set-cookie")) {
-        const setCookies = nativeRes.headers.getSetCookie();
-        if (setCookies?.length) {
-          this.updateCookies(fastGetHostname(req.url), setCookies);
-        }
-      }
-
-      const rawBody = nativeRes.body ?? new ReadableStream<Uint8Array>();
-
-      const bodyPayload = rawBody as unknown as TransportResponsePayload;
-      bodyPayload!.dump = async function (): Promise<void> {
-        return rawBody.cancel().catch(() => {});
       };
 
-      const headersObj: Record<string, string> = {};
+      const nativeRes = await fetch(req.url, init);
+
+      if (nativeRes.headers.has("set-cookie")) {
+        this.maybeStoreCookies(req.url, nativeRes.headers);
+      }
+
+      const body = nativeRes.body ? attachDump(nativeRes.body) : null;
+
+      // ОПТИМИЗАЦИЯ: Высокопроизводительный нативный экспорт без Proxy.
+      // Коллбэк внутри `.forEach()` в Bun вызывается напрямую из C++ обертки.
+      // На выходе получаем чистый, полностью мутабельный объект со склеенными заголовками.
+      const headers: Record<string, string> = {};
       nativeRes.headers.forEach((value, key) => {
-        const first = key.charCodeAt(0);
-        if (first === 99 || first === 67) {
-          const lower = key.toLowerCase();
-          if (lower === "content-encoding" || lower === "content-length") {
-            return;
-          }
-        }
-        headersObj[key] = value;
+        headers[key] = value;
       });
 
       return {
         status: nativeRes.status,
-        headers: headersObj,
+        headers,
         url: nativeRes.url,
-        body: bodyPayload,
+        body,
       };
     } finally {
       this.activeRequests--;
-      if (maxConcurrent > 0 && this.concurrencyQueue.length > 0) {
-        const nextResolver = this.concurrencyQueue.shift();
-        if (nextResolver) nextResolver();
+
+      if (maxConcurrent > 0) {
+        this.releaseSlot();
       }
     }
   }
 
-  private prepareHeaders(req: TransportRequest): Record<string, string> {
-    const original = req.headers as Record<string, string | string[]>;
-    const headers: Record<string, string> = {};
+  private async waitForSlot(signal?: AbortSignal): Promise<void> {
+    return new Promise<void>((resolve, reject) => {
+      const onAbort = () => {
+        signal?.removeEventListener("abort", onAbort);
+        reject(getAbortError(signal));
+      };
 
-    for (const key in original) {
-      if (Object.prototype.hasOwnProperty.call(original, key)) {
-        headers[key] = normalizeHeaderValue(key, original[key]!);
+      if (signal) {
+        signal.addEventListener("abort", onAbort, { once: true });
+      }
+
+      this.concurrencyQueue.push(() => {
+        signal?.removeEventListener("abort", onAbort);
+        resolve();
+      });
+    });
+  }
+
+  private releaseSlot(): void {
+    const len = this.concurrencyQueue.length;
+    while (this.queueHead < len) {
+      const next = this.concurrencyQueue[this.queueHead++];
+      if (next) {
+        next();
+        break;
+      }
+    }
+
+    if (this.queueHead === len) {
+      this.concurrencyQueue.length = 0;
+      this.queueHead = 0;
+    } else if (this.queueHead > 128) {
+      this.concurrencyQueue.splice(0, this.queueHead);
+      this.queueHead = 0;
+    }
+  }
+
+  private prepareHeaders(req: TransportRequest): Record<string, string> {
+    const headers: Record<string, string> = {};
+    const original = req.headers;
+
+    if (original != null) {
+      for (const key in original) {
+        const value = original[key];
+        if (value == null) continue;
+
+        if (typeof value === "string") {
+          headers[key] = value;
+        } else {
+          headers[key] =
+            key.length === 6 && (key === "Cookie" || key === "cookie")
+              ? value.join("; ")
+              : value.join(", ");
+        }
       }
     }
 
     const ua = this._userAgent;
-    if (ua && !headers["User-Agent"] && !headers["user-agent"]) {
+    if (
+      ua !== undefined &&
+      headers["User-Agent"] === undefined &&
+      headers["user-agent"] === undefined
+    ) {
       headers["User-Agent"] = ua;
     }
 
-    const userCookie = normalizeCookieHeader(headers["Cookie"]);
-    const hasUserCookie = userCookie.length > 0;
-
     if (!this.hasCookies) {
-      if (hasUserCookie) {
-        headers["Cookie"] = userCookie;
+      const userCookie = headers["Cookie"];
+      if (userCookie !== undefined) {
+        headers["Cookie"] = userCookie.trim();
       }
       return headers;
     }
@@ -205,10 +263,13 @@ export class BunTransport implements HyperTransport {
     const savedCookies = this.getCookiesForDomain(domain);
     const hasSavedCookies = savedCookies.length > 0;
 
+    const userCookie = headers["Cookie"];
+    const hasUserCookie = userCookie !== undefined && userCookie.length > 0;
+
     if (hasUserCookie && hasSavedCookies) {
-      headers["Cookie"] = `${userCookie}; ${savedCookies}`;
+      headers["Cookie"] = `${userCookie.trim()}; ${savedCookies}`;
     } else if (hasUserCookie) {
-      headers["Cookie"] = userCookie;
+      headers["Cookie"] = userCookie.trim();
     } else if (hasSavedCookies) {
       headers["Cookie"] = savedCookies;
     }
@@ -216,12 +277,19 @@ export class BunTransport implements HyperTransport {
     return headers;
   }
 
+  private maybeStoreCookies(requestUrl: string, headers: Headers): void {
+    const setCookies = (headers as BunHeaders).getSetCookie?.();
+    if (!setCookies || setCookies.length === 0) return;
+
+    this.updateCookies(fastGetHostname(requestUrl), setCookies);
+  }
+
   private getCookiesForDomain(requestDomain: string): string {
-    if (this.cookieCache.has(requestDomain)) {
-      return this.cookieCache.get(requestDomain)!;
-    }
+    const cached = this.cookieCache.get(requestDomain);
+    if (cached !== undefined) return cached;
 
     const matchedCookies: string[] = [];
+
     for (const [storedDomain, cookiesMap] of this.cookieJar) {
       if (
         requestDomain === storedDomain ||
@@ -240,12 +308,11 @@ export class BunTransport implements HyperTransport {
 
   private updateCookies(requestDomain: string, setCookies: string[]): void {
     this.hasCookies = true;
-    for (let i = 0; i < setCookies.length; i++) {
-      const cookieStr = setCookies[i];
+
+    for (const cookieStr of setCookies) {
       if (!cookieStr) continue;
 
       const parts = cookieStr.split(";");
-
       const rawPair = parts[0];
       if (!rawPair) continue;
 
@@ -257,16 +324,15 @@ export class BunTransport implements HyperTransport {
       if (!key) continue;
 
       let targetDomain = requestDomain;
-      for (let j = 1; j < parts.length; j++) {
-        const attr = parts[j];
+
+      for (let i = 1; i < parts.length; i++) {
+        const attr = parts[i];
         if (!attr) continue;
 
-        const trimmedAttr = attr.trim();
-        if (trimmedAttr.toLowerCase().startsWith("domain=")) {
-          let domVal = trimmedAttr.slice(7).trim();
-          if (domVal.startsWith(".")) {
-            domVal = domVal.slice(1);
-          }
+        const trimmed = attr.trim();
+        if (trimmed.toLowerCase().startsWith("domain=")) {
+          let domVal = trimmed.slice(7).trim();
+          if (domVal.startsWith(".")) domVal = domVal.slice(1);
           if (domVal) targetDomain = domVal;
           break;
         }
@@ -279,24 +345,20 @@ export class BunTransport implements HyperTransport {
       }
 
       domainMap.set(key, val);
+    }
 
-      if (this.cookieCache.size > 0) {
-        for (const cachedDomain of this.cookieCache.keys()) {
-          if (
-            cachedDomain === targetDomain ||
-            cachedDomain.endsWith("." + targetDomain)
-          ) {
-            this.cookieCache.delete(cachedDomain);
-          }
-        }
-      }
+    if (this.cookieCache.size > 0) {
+      this.cookieCache.clear();
     }
   }
 
   public async close(): Promise<void> {
-    this.concurrencyQueue = [];
+    this.concurrencyQueue.length = 0;
+    this.queueHead = 0;
     this.cookieJar.clear();
     this.cookieCache.clear();
+    this.activeRequests = 0;
+    this.hasCookies = false;
   }
 
   public async destroy(): Promise<void> {
