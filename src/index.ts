@@ -1,1 +1,1 @@
-export { fastGetHostname, BunTransport } from "./bun.js";
+export { BunTransport } from "./bun.js";
