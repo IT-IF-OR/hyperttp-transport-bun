@@ -1,170 +1,223 @@
 import type {
-  HttpClientOptions,
   HyperTransport,
   TransportRequest,
   TransportResponse,
   TransportResponsePayload,
+  StealthOptions,
+  Fingerprint,
 } from "@hyperttp/types";
-
-type HeaderValue = string | string[];
-type HeaderMap = Record<string, HeaderValue>;
-
-/**
- * @ru Кэш hostname'ов для быстрого извлечения домена из URL.
- * @en Hostname cache for fast domain extraction from URLs.
- */
-let hostnameCacheSize = 0;
-let hostnameCache: Record<string, string> = Object.create(null);
-let lastUrl = "";
-let lastHost = "";
+import type { BunTransportConfig } from "./types/index.js";
+import {
+  fastGetHostname,
+  getAbortError,
+  normalizeBody,
+  normalizeHeaders,
+  resolveUrl,
+  TIMEOUT_ERROR,
+} from "./utils/helpers.js";
 
 /**
- * @ru Быстрое извлечение hostname из URL с кэшированием.
- * @en Fast hostname extraction from URL with caching.
- * @param url - The URL to extract hostname from.
- * @returns The extracted hostname.
+ * @ru Статические пресеты браузерных заголовков для маскировки под реальных пользователей.
+ * Используются stealth-режимом для обхода fingerprint-защит.
+ * @en Static presets of browser headers for masking as real users.
+ * Used by stealth mode to bypass fingerprint protections.
  */
-function fastGetHostname(url: string): string {
-  if (url === lastUrl) return lastHost;
-  if (!url) return "localhost";
+const STEALTH_HEADER_PRESETS: Record<string, Record<string, string>> = {
+  chrome: {
+    "sec-ch-ua": '"Not/A)Brand";v="8", "Chromium";v="126", "Google Chrome";v="126"',
+    "sec-ch-ua-mobile": "?0",
+    "sec-ch-ua-platform": '"Linux"',
+    "sec-fetch-dest": "document",
+    "sec-fetch-mode": "navigate",
+    "sec-fetch-site": "none",
+    "sec-fetch-user": "?1",
+    "upgrade-insecure-requests": "1",
+    "accept-language": "en-US,en;q=0.9",
+  },
+  firefox: {
+    "sec-fetch-dest": "document",
+    "sec-fetch-mode": "navigate",
+    "sec-fetch-site": "none",
+    "accept-language": "en-US,en;q=0.5",
+    "upgrade-insecure-requests": "1",
+  },
+};
 
-  const cached = hostnameCache[url];
-  if (cached !== undefined) {
-    lastUrl = url;
-    lastHost = cached;
-    return cached;
+/**
+ * @ru Пресеты User-Agent, соответствующие TLS-отпечаткам (JA3/JA4).
+ * @en User-Agent presets matching the TLS fingerprints (JA3/JA4).
+ */
+const STEALTH_UA_PRESETS: Record<string, string> = {
+  chrome:
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+  firefox: "Mozilla/5.0 (X11; Linux; rv:126.0) Gecko/20100101 Firefox/126.0",
+  safari:
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15",
+  edge: "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36 Edg/126.0.0.0",
+};
+
+/**
+ * @ru Возвращает строку шифров TLS для указанного профиля браузера.
+ * @en Returns the TLS cipher suite string for the specified browser profile.
+ * @param fingerprint - Browser fingerprint profile.
+ * @returns Colon-separated cipher suite string, or empty string if not found.
+ */
+function getCiphersForProfile(fingerprint: Fingerprint | undefined): string {
+  if (!fingerprint) return "";
+
+  switch (fingerprint) {
+    case "chrome":
+    case "edge":
+      return [
+        "TLS_AES_128_GCM_SHA256",
+        "TLS_AES_256_GCM_SHA384",
+        "TLS_CHACHA20_POLY1305_SHA256",
+        "ECDHE-ECDSA-AES128-GCM-SHA256",
+        "ECDHE-RSA-AES128-GCM-SHA256",
+      ].join(":");
+
+    case "firefox":
+      return [
+        "TLS_AES_128_GCM_SHA256",
+        "TLS_CHACHA20_POLY1305_SHA256",
+        "TLS_AES_256_GCM_SHA384",
+        "ECDHE-ECDSA-AES128-GCM-SHA256",
+        "ECDHE-RSA-AES128-GCM-SHA256",
+      ].join(":");
+
+    case "safari":
+      return [
+        "TLS_AES_256_GCM_SHA384",
+        "TLS_CHACHA20_POLY1305_SHA256",
+        "TLS_AES_128_GCM_SHA256",
+        "ECDHE-ECDSA-AES256-GCM-SHA384",
+        "ECDHE-RSA-AES256-GCM-SHA384",
+      ].join(":");
+
+    default:
+      return "";
   }
+}
 
-  let start = 0;
-  const first = url.charCodeAt(0);
+/**
+ * @ru Безопасно применяет стелс-пресеты, отдавая абсолютный приоритет ручным заголовкам.
+ * @en Safely applies stealth presets, giving absolute priority to manual headers.
+ * @param headers - The headers object to modify.
+ * @param stealth - Stealth configuration options.
+ * @returns The modified headers object.
+ */
+function applyStealthHeaders(
+  headers: Record<string, string>,
+  stealth: StealthOptions,
+): Record<string, string> {
+  if (!stealth || !stealth.fingerprint) return headers;
 
-  if (first === 47) {
-    start = url.charCodeAt(1) === 47 ? 2 : 0;
-    if (start === 0) return "localhost";
-  } else {
-    const schemeIdx = url.indexOf("://");
-    if (schemeIdx !== -1) start = schemeIdx + 3;
-  }
+  const presetName = stealth.fingerprint;
+  const presetHeaders = STEALTH_HEADER_PRESETS[presetName];
 
-  let end = url.length;
-  for (let i = start; i < end; i++) {
-    const code = url.charCodeAt(i);
-    if (code === 47 || code === 63 || code === 35) {
-      end = i;
-      break;
+  if (presetHeaders) {
+    for (const key in presetHeaders) {
+      if (headers[key] === undefined) {
+        headers[key] = presetHeaders[key]!;
+      }
     }
   }
 
-  const atIdx = url.indexOf("@", start);
-  if (atIdx !== -1 && atIdx < end) start = atIdx + 1;
-
-  const colonIdx = url.indexOf(":", start);
-  if (colonIdx !== -1 && colonIdx < end) end = colonIdx;
-
-  const host = url.slice(start, end) || "localhost";
-
-  if (hostnameCacheSize > 1024) {
-    hostnameCache = Object.create(null);
-    hostnameCacheSize = 0;
+  const currentUA = headers["user-agent"];
+  if (currentUA === undefined || currentUA === "hyperttp/2.0" || currentUA === "Hyperttp/2.0") {
+    const browserUA = STEALTH_UA_PRESETS[presetName];
+    if (browserUA) {
+      headers["user-agent"] = browserUA;
+    }
   }
 
-  hostnameCache[url] = host;
-  hostnameCacheSize++;
-  lastUrl = url;
-  lastHost = host;
-  return host;
+  return headers;
 }
 
 /**
- * @ru Разрешает относительный URL относительно baseUrl.
- * @en Resolves a relative URL against a baseUrl.
- * @param baseUrl - The base URL.
- * @param url - The URL to resolve.
- * @returns The resolved absolute URL.
- */
-function resolveUrl(baseUrl: string, url: string): string {
-  if (url.charCodeAt(0) === 47) return baseUrl + url;
-  if (url.startsWith("http://") || url.startsWith("https://")) return url;
-  return baseUrl + "/" + url;
-}
-
-/**
- * @ru Кэшированные DOMException для частых ошибок abort/timeout.
- * @en Cached DOMException for frequent abort/timeout errors.
- */
-const ABORT_ERROR = new DOMException("The operation was aborted.", "AbortError");
-const TIMEOUT_ERROR = new DOMException("The operation was aborted due to timeout.", "TimeoutError");
-
-/**
- * @ru Извлекает причину abort из signal или возвращает кэшированную ошибку.
- * @en Extracts abort reason from signal or returns cached error.
- * @param signal - Optional abort signal.
- * @returns The abort error or reason.
- */
-function getAbortError(signal?: AbortSignal): unknown {
-  return signal?.reason ?? ABORT_ERROR;
-}
-
-/**
- * @ru Нормализует тело запроса в формат, совместимый с fetch.
- * @en Normalizes request body to fetch-compatible format.
- * @param body - The request body to normalize.
- * @returns The normalized body or undefined.
- */
-function normalizeBody(body: TransportRequest["body"]): BodyInit | undefined {
-  if (body == null) return undefined;
-
-  if (typeof body === "string") return body;
-  if (body instanceof Uint8Array) return body as unknown as BodyInit;
-  if (body instanceof ArrayBuffer) return body;
-  if (ArrayBuffer.isView(body)) return body as unknown as BodyInit;
-
-  if (typeof ReadableStream !== "undefined" && body instanceof ReadableStream) return body;
-  if (typeof URLSearchParams !== "undefined" && body instanceof URLSearchParams) return body;
-  if (typeof FormData !== "undefined" && body instanceof FormData) return body;
-  if (typeof Blob !== "undefined" && body instanceof Blob) return body;
-  if (typeof body === "object") return JSON.stringify(body);
-
-  return String(body);
-}
-
-/**
- * @ru Конфигурация транспорта Bun.
- * @en Bun transport configuration.
- */
-export interface BunTransportConfig extends HttpClientOptions {
-  /**
-   * @ru Базовый URL для всех запросов.
-   * @en Base URL for all requests.
-   */
-  baseUrl?: string;
-}
-
-/**
- * @ru Высокопроизводительный HTTP-транспорт для Bun с нативными оптимизациями.
- * Поддерживает cookies, concurrency control, таймауты, keepalive и TLS конфигурацию.
- * @en High-performance HTTP transport for Bun with native optimizations.
- * Supports cookies, concurrency control, timeouts, keepalive, and TLS configuration.
+ * @ru Высокопроизводительный HTTP-транспорт для Bun с нативными оптимизациями и поддержкой Stealth-мимикрии.
+ * Включает управление параллелизмом, cookie jar и кэширование доменов.
+ * @en High-performance HTTP transport for Bun with native optimizations and Stealth mimicry support.
+ * Includes concurrency management, cookie jar, and domain caching.
  */
 export class BunTransport implements HyperTransport {
+  /**
+   * @ru Конфигурация транспорта.
+   * @en Transport configuration.
+   */
   public config: BunTransportConfig;
 
+  /**
+   * @ru Хранилище cookies по доменам (domain -> name -> value).
+   * @en Cookie storage by domain (domain -> name -> value).
+   */
   private cookieJar: Record<string, Record<string, string>> = Object.create(null);
+
+  /**
+   * @ru Список всех доменов, для которых хранятся cookies.
+   * @en List of all domains for which cookies are stored.
+   */
   private readonly cookieDomains: string[] = [];
+
+  /**
+   * @ru Кэш сгенерированных строк cookies для быстрого доступа.
+   * @en Cache of generated cookie strings for fast access.
+   */
   private cookieCache: Record<string, string> = Object.create(null);
+
+  /**
+   * @ru Текущий размер кэша cookies.
+   * @en Current size of the cookie cache.
+   */
   private cookieCacheSize = 0;
 
+  /**
+   * @ru Счётчик активных (выполняющихся) запросов.
+   * @en Counter of active (in-flight) requests.
+   */
   private activeRequests = 0;
+
+  /**
+   * @ru Очередь запросов, ожидающих свободного слота при достижении лимита параллелизма.
+   * @en Queue of requests waiting for a free slot when concurrency limit is reached.
+   */
   private concurrencyQueue: Record<number, () => void> = Object.create(null);
+
+  /**
+   * @ru Индекс начала очереди (для FIFO обработки).
+   * @en Queue head index (for FIFO processing).
+   */
   private queueHead = 0;
+
+  /**
+   * @ru Индекс конца очереди (для добавления новых элементов).
+   * @en Queue tail index (for adding new elements).
+   */
   private queueTail = 0;
 
-  private hasCookies = false;
+  /**
+   * @ru Максимальное количество одновременных запросов (0 = без лимита).
+   * @en Maximum number of concurrent requests (0 = unlimited).
+   */
   private _maxConcurrent = 0;
+
+  /**
+   * @ru Таймаут запроса в миллисекундах (0 = без таймаута).
+   * @en Request timeout in milliseconds (0 = no timeout).
+   */
   private _timeout = 0;
-  private _userAgent: string | undefined = undefined;
+
+  /**
+   * @ru Флаг использования keep-alive соединений.
+   * @en Flag for using keep-alive connections.
+   */
   private _keepalive = false;
-  private _tlsConfig: { rejectUnauthorized: boolean } | null = null;
+
+  /**
+   * @ru Конфигурация TLS (отклонение невалидных сертификатов и шифры).
+   * @en TLS configuration (reject unauthorized certificates and ciphers).
+   */
+  private _tlsConfig: { rejectUnauthorized: boolean; ciphers?: string } | null = null;
 
   /**
    * @ru Создаёт экземпляр BunTransport.
@@ -177,23 +230,25 @@ export class BunTransport implements HyperTransport {
   }
 
   /**
-   * @ru Инвалидирует кэшированные настройки при изменении конфигурации.
-   * @en Invalidates cached settings when configuration changes.
+   * @ru Обновляет внутреннее состояние на основе конфигурации.
+   * Вызывается при создании и может быть вызвано при изменении конфига.
+   * @en Updates internal state based on configuration.
+   * Called on creation and can be called when config changes.
    */
   private invalidateConfig(): void {
     const net = this.config?.network;
     this._maxConcurrent = net?.maxConcurrent ?? 0;
     this._timeout = net?.timeout ?? 0;
-    this._userAgent = net?.userAgent;
     this._keepalive = !!net?.keepAliveTimeout;
     this._tlsConfig = (net?.rejectUnauthorized ?? true) ? null : { rejectUnauthorized: false };
   }
 
   /**
-   * @ru Выполняет HTTP-запрос через нативный fetch Bun.
-   * @en Executes an HTTP request via Bun's native fetch.
+   * @ru Выполняет HTTP-запрос через нативный fetch Bun с управлением параллелизмом и таймаутами.
+   * @en Executes an HTTP request via Bun's native fetch with concurrency management and timeouts.
    * @param req - The normalized transport request.
    * @returns Promise resolving to the transport response.
+   * @throws Error if the request is aborted or times out.
    */
   public async execute(req: TransportRequest): Promise<TransportResponse> {
     const maxConcurrent = this._maxConcurrent;
@@ -229,19 +284,44 @@ export class BunTransport implements HyperTransport {
     this.activeRequests++;
 
     try {
-      const headers = this.prepareHeaders(req);
       const fullUrl = resolveUrl(this.config?.baseUrl ?? "", req.url);
+      let headers = normalizeHeaders(req.headers) as Record<string, string>;
+
+      const requestDomain = fastGetHostname(fullUrl);
+      const activeCookies = this.getCookiesForDomain(requestDomain);
+      if (activeCookies.length > 0) {
+        headers["cookie"] = headers["cookie"]
+          ? headers["cookie"] + "; " + activeCookies
+          : activeCookies;
+      }
+
+      const stealth =
+        req.stealth || this.config.stealth ? { ...this.config.stealth, ...req.stealth } : undefined;
+
+      if (stealth) {
+        headers = applyStealthHeaders(headers, stealth);
+      }
 
       const init: RequestInit & { tls?: unknown } = {
         method: req.method,
         redirect: "manual",
+        headers: headers as HeadersInit,
       };
 
-      if (headers !== undefined) init.headers = headers as HeadersInit;
       if (req.body !== undefined) init.body = normalizeBody(req.body);
       if (signal !== undefined) init.signal = signal;
       if (this._keepalive) init.keepalive = true;
-      if (this._tlsConfig !== null) init.tls = this._tlsConfig;
+
+      let requestTlsConfig = this._tlsConfig;
+      if (stealth?.ciphers || stealth?.fingerprint) {
+        const ciphers = stealth.ciphers ?? getCiphersForProfile(stealth.fingerprint);
+        if (ciphers) {
+          requestTlsConfig = requestTlsConfig
+            ? { ...requestTlsConfig, ciphers }
+            : { rejectUnauthorized: true, ciphers };
+        }
+      }
+      if (requestTlsConfig !== null) init.tls = requestTlsConfig;
 
       const nativeRes = await fetch(fullUrl, init);
 
@@ -250,11 +330,32 @@ export class BunTransport implements HyperTransport {
         timer = null;
       }
 
+      this.storeCookies(fullUrl, nativeRes.headers);
+
+      const bodyStream = nativeRes.body;
+      if (bodyStream !== null && typeof (bodyStream as any).dump !== "function") {
+        Object.defineProperty(bodyStream, "dump", {
+          value: function (this: ReadableStream): Promise<void> {
+            return this.cancel();
+          },
+          enumerable: false,
+          configurable: true,
+        });
+      }
+
+      const responseHeaders = (() => {
+        const resH: Record<string, string | string[]> = Object.create(null);
+        nativeRes.headers.forEach((value, key) => {
+          resH[key.toLowerCase()] = value;
+        });
+        return resH;
+      })();
+
       return {
         status: nativeRes.status,
         url: nativeRes.url,
-        body: nativeRes.body as TransportResponsePayload,
-        headers: nativeRes.headers as unknown as Record<string, string | string[]>,
+        body: bodyStream as unknown as TransportResponsePayload,
+        headers: responseHeaders,
       };
     } catch (err) {
       if (timer !== null) clearTimeout(timer);
@@ -266,95 +367,10 @@ export class BunTransport implements HyperTransport {
   }
 
   /**
-   * @ru Подготавливает заголовки запроса, добавляя User-Agent и cookies.
-   * @en Prepares request headers, adding User-Agent and cookies.
-   * @param req - The transport request.
-   * @returns The prepared headers or undefined.
-   */
-  private prepareHeaders(req: TransportRequest): HeaderMap | undefined {
-    const original = req.headers as HeaderMap | undefined;
-    const needUA = this._userAgent !== undefined;
-    const needCookies = this.hasCookies;
-
-    if (!needUA && !needCookies) return original;
-
-    if (original == null) {
-      const headers: HeaderMap = Object.create(null);
-      if (needUA) headers["user-agent"] = this._userAgent!;
-      if (needCookies) {
-        const savedCookies = this.getCookiesForDomain(fastGetHostname(req.url));
-        if (savedCookies.length > 0) headers["cookie"] = savedCookies;
-      }
-      return headers;
-    }
-
-    if (needUA && original["user-agent"] === undefined) {
-      original["user-agent"] = this._userAgent!;
-    }
-
-    if (needCookies) {
-      const savedCookies = this.getCookiesForDomain(fastGetHostname(req.url));
-      if (savedCookies.length > 0) {
-        const currentCookie = original["cookie"];
-        original["cookie"] = currentCookie ? currentCookie + "; " + savedCookies : savedCookies;
-      }
-    }
-
-    return original;
-  }
-
-  /**
-   * @ru Ожидает свободный слот в очереди concurrency.
-   * @en Waits for an available slot in the concurrency queue.
-   * @param signal - Optional abort signal.
-   * @returns Promise that resolves when a slot is available.
-   */
-  private async waitForSlot(signal?: AbortSignal): Promise<void> {
-    return new Promise<void>((resolve, reject) => {
-      const currentTail = this.queueTail++;
-
-      const onAbort = () => {
-        signal?.removeEventListener("abort", onAbort);
-        delete this.concurrencyQueue[currentTail];
-        reject(getAbortError(signal));
-      };
-
-      if (signal) signal.addEventListener("abort", onAbort, { once: true });
-
-      this.concurrencyQueue[currentTail] = () => {
-        signal?.removeEventListener("abort", onAbort);
-        resolve();
-      };
-    });
-  }
-
-  /**
-   * @ru Освобождает слот и уведомляет следующий запрос в очереди.
-   * @en Releases a slot and notifies the next request in the queue.
-   */
-  private releaseSlot(): void {
-    while (this.queueHead < this.queueTail) {
-      const next = this.concurrencyQueue[this.queueHead];
-      if (next !== undefined) {
-        delete this.concurrencyQueue[this.queueHead];
-        this.queueHead++;
-        next();
-        return;
-      }
-      this.queueHead++;
-    }
-
-    if (this.queueHead === this.queueTail) {
-      this.queueHead = 0;
-      this.queueTail = 0;
-    }
-  }
-
-  /**
-   * @ru Извлекает cookies для указанного домена из cookie jar.
-   * @en Retrieves cookies for the specified domain from the cookie jar.
+   * @ru Получает строку cookies для указанного домена с учётом родительских доменов.
+   * @en Gets the cookie string for the specified domain, considering parent domains.
    * @param requestDomain - The domain to get cookies for.
-   * @returns The cookie string or empty string.
+   * @returns Semicolon-separated cookie string.
    */
   private getCookiesForDomain(requestDomain: string): string {
     const cached = this.cookieCache[requestDomain];
@@ -389,9 +405,119 @@ export class BunTransport implements HyperTransport {
   }
 
   /**
-   * @ru Мягко закрывает транспорт, очищая очереди и cookies.
-   * @en Gracefully closes the transport, clearing queues and cookies.
-   * @returns Promise that resolves when the transport is closed.
+   * @ru Сохраняет cookies из заголовков Set-Cookie ответа в cookie jar.
+   * @en Stores cookies from response Set-Cookie headers into the cookie jar.
+   * @param requestUrl - The request URL for determining the default domain.
+   * @param headers - Response headers containing Set-Cookie values.
+   */
+  private storeCookies(requestUrl: string, headers: Headers): void {
+    if (typeof headers.getSetCookie !== "function") return;
+
+    const setCookies = headers.getSetCookie();
+    if (setCookies.length === 0) return;
+
+    const defaultDomain = fastGetHostname(requestUrl);
+    let hasChanges = false;
+
+    for (let i = 0; i < setCookies.length; i++) {
+      const rawCookie = setCookies[i];
+      if (!rawCookie) continue;
+
+      const firstSemicolon = rawCookie.indexOf(";");
+      const mainPair = firstSemicolon === -1 ? rawCookie : rawCookie.slice(0, firstSemicolon);
+
+      const eqIdx = mainPair.indexOf("=");
+      if (eqIdx === -1) continue;
+
+      const name = mainPair.slice(0, eqIdx).trim();
+      const value = mainPair.slice(eqIdx + 1).trim();
+      if (!name) continue;
+
+      let domain = defaultDomain;
+
+      if (firstSemicolon !== -1) {
+        const parts = rawCookie.split(";");
+        for (let j = 1; j < parts.length; j++) {
+          const part = parts[j]!.trim();
+          if (part.length > 7 && part.toLowerCase().startsWith("domain=")) {
+            const rawDomain = part.slice(7).trim();
+            if (rawDomain) {
+              domain = rawDomain.charCodeAt(0) === 46 ? rawDomain.slice(1) : rawDomain;
+            }
+            break;
+          }
+        }
+      }
+
+      if (this.cookieJar[domain] === undefined) {
+        this.cookieJar[domain] = Object.create(null);
+        if (!this.cookieDomains.includes(domain)) {
+          this.cookieDomains.push(domain);
+        }
+      }
+
+      this.cookieJar[domain]![name] = value;
+      hasChanges = true;
+    }
+
+    if (hasChanges) {
+      this.cookieCache = Object.create(null);
+      this.cookieCacheSize = 0;
+    }
+  }
+
+  /**
+   * @ru Ожидает освобождения слота в очереди параллелизма.
+   * @en Waits for a slot to become available in the concurrency queue.
+   * @param signal - Optional abort signal to cancel waiting.
+   * @returns Promise that resolves when a slot is available.
+   * @throws Error if the signal is aborted while waiting.
+   */
+  private async waitForSlot(signal?: AbortSignal): Promise<void> {
+    return new Promise<void>((resolve, reject) => {
+      const currentTail = this.queueTail++;
+
+      const onAbort = () => {
+        signal?.removeEventListener("abort", onAbort);
+        delete this.concurrencyQueue[currentTail];
+        reject(getAbortError(signal));
+      };
+
+      if (signal) signal.addEventListener("abort", onAbort, { once: true });
+
+      this.concurrencyQueue[currentTail] = () => {
+        signal?.removeEventListener("abort", onAbort);
+        resolve();
+      };
+    });
+  }
+
+  /**
+   * @ru Освобождает слот и разблокирует следующий запрос в очереди.
+   * @en Releases a slot and unblocks the next request in the queue.
+   */
+  private releaseSlot(): void {
+    while (this.queueHead < this.queueTail) {
+      const next = this.concurrencyQueue[this.queueHead];
+      if (next !== undefined) {
+        delete this.concurrencyQueue[this.queueHead];
+        this.queueHead++;
+        next();
+        return;
+      }
+      this.queueHead++;
+    }
+
+    if (this.queueHead === this.queueTail) {
+      this.queueHead = 0;
+      this.queueTail = 0;
+    }
+  }
+
+  /**
+   * @ru Мягко закрывает транспорт, очищая очереди и cookie jar.
+   * @en Gracefully closes the transport, clearing queues and cookie jar.
+   * @returns Promise that resolves when cleanup is complete.
    */
   public async close(): Promise<void> {
     this.concurrencyQueue = Object.create(null);
@@ -402,13 +528,12 @@ export class BunTransport implements HyperTransport {
     this.cookieCache = Object.create(null);
     this.cookieCacheSize = 0;
     this.activeRequests = 0;
-    this.hasCookies = false;
   }
 
   /**
-   * @ru Принудительно уничтожает транспорт и все активные соединения.
-   * @en Immediately destroys the transport and all active connections.
-   * @returns Promise that resolves when the transport is destroyed.
+   * @ru Принудительно уничтожает транспорт (алиас для close()).
+   * @en Forcefully destroys the transport (alias for close()).
+   * @returns Promise that resolves when cleanup is complete.
    */
   public async destroy(): Promise<void> {
     await this.close();
