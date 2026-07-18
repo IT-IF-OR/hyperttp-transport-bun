@@ -10,11 +10,11 @@ import type { BunTransportConfig } from "./types/index.js";
 import {
   fastGetHostname,
   getAbortError,
-  normalizeBody,
   normalizeHeaders,
   resolveUrl,
   TIMEOUT_ERROR,
 } from "./utils/helpers.js";
+import { CacheManager } from "hcacher";
 
 /**
  * @ru Статические пресеты браузерных заголовков для маскировки под реальных пользователей.
@@ -148,28 +148,22 @@ export class BunTransport implements HyperTransport {
   public config: BunTransportConfig;
 
   /**
-   * @ru Хранилище cookies по доменам (domain -> name -> value).
-   * @en Cookie storage by domain (domain -> name -> value).
+   * @ru Кэш cookies по доменам с TTL и LRU-эвикцией (domain -> name -> value).
+   * @en Cookie cache by domain with TTL and LRU eviction (domain -> name -> value).
    */
-  private cookieJar: Record<string, Record<string, string>> = Object.create(null);
+  private readonly cookieStore: CacheManager<Record<string, string>>;
 
   /**
-   * @ru Список всех доменов, для которых хранятся cookies.
-   * @en List of all domains for which cookies are stored.
+   * @ru Кэш сгенерированных строк cookies с TTL.
+   * @en Cache of generated cookie strings with TTL.
    */
-  private readonly cookieDomains: string[] = [];
+  private readonly cookieStringCache: CacheManager<string>;
 
   /**
-   * @ru Кэш сгенерированных строк cookies для быстрого доступа.
-   * @en Cache of generated cookie strings for fast access.
+   * @ru Опциональный кэш HTTP-ответов для GET/HEAD запросов.
+   * @en Optional HTTP response cache for GET/HEAD requests.
    */
-  private cookieCache: Record<string, string> = Object.create(null);
-
-  /**
-   * @ru Текущий размер кэша cookies.
-   * @en Current size of the cookie cache.
-   */
-  private cookieCacheSize = 0;
+  private readonly responseCache?: CacheManager<TransportResponse>;
 
   /**
    * @ru Счётчик активных (выполняющихся) запросов.
@@ -226,6 +220,32 @@ export class BunTransport implements HyperTransport {
    */
   constructor(config: BunTransportConfig) {
     this.config = config;
+
+    const cookieCfg = config?.network?.cookieCache;
+    this.cookieStore = new CacheManager<Record<string, string>>({
+      enabled: cookieCfg?.enabled ?? true,
+      maxSize: cookieCfg?.maxSize ?? 256,
+      ttl: cookieCfg?.ttl ?? 300_000,
+      touchOnGet: true,
+    });
+
+    this.cookieStringCache = new CacheManager<string>({
+      enabled: cookieCfg?.enabled ?? true,
+      maxSize: cookieCfg?.maxSize ?? 1024,
+      ttl: cookieCfg?.ttl ?? 60_000,
+      touchOnGet: true,
+    });
+
+    const cacheCfg = config?.network?.cache;
+    if (cacheCfg?.enabled !== false && (cacheCfg?.maxSize || cacheCfg?.ttl)) {
+      this.responseCache = new CacheManager<TransportResponse>({
+        enabled: cacheCfg?.enabled ?? true,
+        maxSize: cacheCfg?.maxSize ?? 256,
+        ttl: cacheCfg?.ttl ?? 30_000,
+        touchOnGet: true,
+      });
+    }
+
     this.invalidateConfig();
   }
 
@@ -256,6 +276,8 @@ export class BunTransport implements HyperTransport {
 
     let signal = req.signal;
     let timer: ReturnType<typeof setTimeout> | null = null;
+    let abortHandler: (() => void) | null = null;
+    let originalSignal: AbortSignal | null = null;
 
     if (timeoutMs > 0) {
       if (!signal) {
@@ -264,27 +286,49 @@ export class BunTransport implements HyperTransport {
         throw getAbortError(signal);
       } else {
         const controller = new AbortController();
-        const originalSignal = signal;
+        originalSignal = signal;
 
-        originalSignal.addEventListener("abort", () => controller.abort(originalSignal.reason), {
-          once: true,
-        });
+        abortHandler = () => controller.abort(originalSignal!.reason);
+        originalSignal.addEventListener("abort", abortHandler);
         timer = setTimeout(() => controller.abort(TIMEOUT_ERROR), timeoutMs);
         signal = controller.signal;
       }
     }
 
-    if (signal?.aborted) throw getAbortError(signal);
+    if (signal?.aborted) {
+      if (timer !== null) clearTimeout(timer);
+      if (originalSignal && abortHandler) originalSignal.removeEventListener("abort", abortHandler);
+      throw getAbortError(signal);
+    }
 
     if (maxConcurrent > 0 && this.activeRequests >= maxConcurrent) {
-      await this.waitForSlot(signal);
-      if (signal?.aborted) throw getAbortError(signal);
+      try {
+        await this.waitForSlot(signal);
+      } catch (err) {
+        if (timer !== null) clearTimeout(timer);
+        if (originalSignal && abortHandler) originalSignal.removeEventListener("abort", abortHandler);
+        throw err;
+      }
+      if (signal?.aborted) {
+        if (timer !== null) clearTimeout(timer);
+        if (originalSignal && abortHandler) originalSignal.removeEventListener("abort", abortHandler);
+        throw getAbortError(signal);
+      }
     }
 
     this.activeRequests++;
 
     try {
       const fullUrl = resolveUrl(this.config?.baseUrl ?? "", req.url);
+
+      if (this.responseCache && (req.method === "GET" || req.method === "HEAD") && !req.body) {
+        const cacheKey = `${req.method}:${fullUrl}`;
+        const cached = this.responseCache.get(cacheKey);
+        if (cached !== undefined) {
+          return cached;
+        }
+      }
+
       let headers = normalizeHeaders(req.headers) as Record<string, string>;
 
       const requestDomain = fastGetHostname(fullUrl);
@@ -304,11 +348,11 @@ export class BunTransport implements HyperTransport {
 
       const init: RequestInit & { tls?: unknown } = {
         method: req.method,
-        redirect: "manual",
+        redirect: (req as any).redirect ?? "manual",
         headers: headers as HeadersInit,
       };
 
-      if (req.body !== undefined) init.body = normalizeBody(req.body);
+      if (req.body !== undefined) init.body = req.body as BodyInit;
       if (signal !== undefined) init.signal = signal;
       if (this._keepalive) init.keepalive = true;
 
@@ -325,23 +369,9 @@ export class BunTransport implements HyperTransport {
 
       const nativeRes = await fetch(fullUrl, init);
 
-      if (timer !== null) {
-        clearTimeout(timer);
-        timer = null;
-      }
-
       this.storeCookies(fullUrl, nativeRes.headers);
 
       const bodyStream = nativeRes.body;
-      if (bodyStream !== null && typeof (bodyStream as any).dump !== "function") {
-        Object.defineProperty(bodyStream, "dump", {
-          value: function (this: ReadableStream): Promise<void> {
-            return this.cancel();
-          },
-          enumerable: false,
-          configurable: true,
-        });
-      }
 
       const responseHeaders = (() => {
         const resH: Record<string, string | string[]> = Object.create(null);
@@ -351,16 +381,26 @@ export class BunTransport implements HyperTransport {
         return resH;
       })();
 
-      return {
+      const response: TransportResponse = {
         status: nativeRes.status,
         url: nativeRes.url,
         body: bodyStream as unknown as TransportResponsePayload,
         headers: responseHeaders,
       };
-    } catch (err) {
-      if (timer !== null) clearTimeout(timer);
-      throw err;
+
+      if (this.responseCache && (req.method === "GET" || req.method === "HEAD") && !req.body) {
+        const cacheKey = `${req.method}:${fullUrl}`;
+        this.responseCache.set(cacheKey, response);
+      }
+
+      return response;
     } finally {
+      if (timer !== null) {
+        clearTimeout(timer);
+      }
+      if (originalSignal && abortHandler) {
+        originalSignal.removeEventListener("abort", abortHandler);
+      }
       this.activeRequests--;
       if (maxConcurrent > 0) this.releaseSlot();
     }
@@ -373,19 +413,17 @@ export class BunTransport implements HyperTransport {
    * @returns Semicolon-separated cookie string.
    */
   private getCookiesForDomain(requestDomain: string): string {
-    const cached = this.cookieCache[requestDomain];
+    const cached = this.cookieStringCache.get(requestDomain);
     if (cached !== undefined) return cached;
 
     let result = "";
-    const domainsLen = this.cookieDomains.length;
+    const domains = this.cookieStore.size > 0 ? this.getAllCookieDomains() : [];
 
-    for (let i = 0; i < domainsLen; i++) {
-      const storedDomain = this.cookieDomains[i];
-      if (!storedDomain) continue;
-
+    for (let i = 0; i < domains.length; i++) {
+      const storedDomain = domains[i]!;
       if (requestDomain !== storedDomain && !requestDomain.endsWith("." + storedDomain)) continue;
 
-      const cookiesMap = this.cookieJar[storedDomain];
+      const cookiesMap = this.cookieStore.get(storedDomain);
       if (!cookiesMap) continue;
 
       for (const key in cookiesMap) {
@@ -394,14 +432,21 @@ export class BunTransport implements HyperTransport {
       }
     }
 
-    if (this.cookieCacheSize > 1024) {
-      this.cookieCache = Object.create(null);
-      this.cookieCacheSize = 0;
-    }
-
-    this.cookieCache[requestDomain] = result;
-    this.cookieCacheSize++;
+    this.cookieStringCache.set(requestDomain, result);
     return result;
+  }
+
+  /**
+   * @ru Возвращает все домены из cookie store.
+   * @en Returns all domains from the cookie store.
+   */
+  private getAllCookieDomains(): string[] {
+    const domains: string[] = [];
+    const store = (this.cookieStore as any).storage as Map<string, unknown>;
+    for (const key of store.keys()) {
+      domains.push(key);
+    }
+    return domains;
   }
 
   /**
@@ -417,7 +462,6 @@ export class BunTransport implements HyperTransport {
     if (setCookies.length === 0) return;
 
     const defaultDomain = fastGetHostname(requestUrl);
-    let hasChanges = false;
 
     for (let i = 0; i < setCookies.length; i++) {
       const rawCookie = setCookies[i];
@@ -449,20 +493,11 @@ export class BunTransport implements HyperTransport {
         }
       }
 
-      if (this.cookieJar[domain] === undefined) {
-        this.cookieJar[domain] = Object.create(null);
-        if (!this.cookieDomains.includes(domain)) {
-          this.cookieDomains.push(domain);
-        }
-      }
+      const existing = this.cookieStore.get(domain) ?? Object.create(null);
+      existing[name] = value;
+      this.cookieStore.set(domain, existing);
 
-      this.cookieJar[domain]![name] = value;
-      hasChanges = true;
-    }
-
-    if (hasChanges) {
-      this.cookieCache = Object.create(null);
-      this.cookieCacheSize = 0;
+      this.cookieStringCache.delete(domain);
     }
   }
 
@@ -523,10 +558,9 @@ export class BunTransport implements HyperTransport {
     this.concurrencyQueue = Object.create(null);
     this.queueHead = 0;
     this.queueTail = 0;
-    this.cookieJar = Object.create(null);
-    this.cookieDomains.length = 0;
-    this.cookieCache = Object.create(null);
-    this.cookieCacheSize = 0;
+    this.cookieStore.clear();
+    this.cookieStringCache.clear();
+    this.responseCache?.clear();
     this.activeRequests = 0;
   }
 

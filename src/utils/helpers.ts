@@ -100,29 +100,6 @@ export function getAbortError(signal?: AbortSignal): unknown {
 }
 
 /**
- * @ru Нормализует тело запроса в формат, совместимый с fetch.
- * @en Normalizes request body to fetch-compatible format.
- * @param body - The request body to normalize.
- * @returns The normalized body or undefined.
- */
-export function normalizeBody(body: TransportRequest["body"]): BodyInit | undefined {
-  if (body == null) return undefined;
-
-  if (typeof body === "string") return body;
-  if (body instanceof Uint8Array) return body as unknown as BodyInit;
-  if (body instanceof ArrayBuffer) return body;
-  if (ArrayBuffer.isView(body)) return body as unknown as BodyInit;
-
-  if (typeof ReadableStream !== "undefined" && body instanceof ReadableStream) return body;
-  if (typeof URLSearchParams !== "undefined" && body instanceof URLSearchParams) return body;
-  if (typeof FormData !== "undefined" && body instanceof FormData) return body;
-  if (typeof Blob !== "undefined" && body instanceof Blob) return body;
-  if (typeof body === "object") return JSON.stringify(body);
-
-  return String(body);
-}
-
-/**
  * @ru Нормализует заголовки, переводя все ключи в нижний регистр (lowercase).
  * @en Normalizes headers by transforming all keys into lowercase layout.
  */

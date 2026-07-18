@@ -1,25 +1,24 @@
 # BunTransport
 
-`BunTransport` is a network transport implementation for `HyperTransport`, designed to run in the **Bun runtime**.
+`BunTransport` is a high-performance HTTP transport for the
+[HyperTransport](https://github.com/IT-IF-OR) ecosystem, designed for the **Bun runtime**.
 
-It wraps `fetch` and adds:
+It wraps native `fetch` and adds:
 
-- concurrency limiting
+- concurrency limiting with FIFO queue
 - request timeouts via `AbortSignal`
-- automatic cookie handling
+- automatic cookie handling with TTL and LRU eviction
+- response caching for GET/HEAD requests
+- stealth / fingerprint mimicry (JA3/JA4)
 - header normalization
 - `keepalive` support
-- access to Bun `tls` options
+- TLS configuration (ciphers, `rejectUnauthorized`)
 
 ---
 
 ## Interface
 
 ```ts
-/**
- * @ru Общий интерфейс для реализации сетевых транспортов.
- * @en Unified interface for building runtime-specific network transports.
- */
 export interface HyperTransport {
   execute(req: TransportRequest): Promise<TransportResponse>;
   close?(): Promise<void>;
@@ -34,13 +33,33 @@ export interface HyperTransport {
 ## Features
 
 - `fetch`-based implementation with `signal` support
-- `redirect: "manual"`
 - automatic merging of cookies from responses and subsequent requests
-- cookie cache per domain
-- request concurrency limiting
+- cookie cache per domain with configurable TTL
+- response cache for GET/HEAD requests (optional, via `hcacher`)
+- request concurrency limiting with FIFO queue
 - request timeout support
-- automatic `User-Agent` injection from config (if not provided manually)
+- stealth mode: browser-like TLS fingerprint emulation (Chrome, Firefox, Safari, Edge)
+- `baseUrl` support for relative URLs
 - compatibility with `TransportRequest` / `TransportResponse`
+
+---
+
+## Benchmark
+
+Benchmark results on **Bun 1.3.14** (20K requests, 200 concurrent, 60s duration):
+
+```text
+Environment: linux 7.1.3-zen2-1-zen | Intel Core i5-8600K @ 3.60GHz
+```
+
+| Rank | Client         | RPS    | Avg      | p50      | p90      | p99      | Errors |
+| ---- | -------------- | ------ | -------- | -------- | -------- | -------- | ------ |
+| 1    | bun-fetch      | 25.92K | 7.65 ms  | 7.69 ms  | 10.41 ms | 14.00 ms | 0      |
+| 2    | undici         | 21.47K | 9.28 ms  | 9.54 ms  | 12.80 ms | 14.77 ms | 0      |
+| 3    | @hyperttp/core | 14.70K | 13.53 ms | 12.03 ms | 17.36 ms | 19.72 ms | 0      |
+| 4    | axios          | 6.24K  | 31.85 ms | 31.83 ms | 33.82 ms | 36.10 ms | 0      |
+
+`BunTransport` (via `@hyperttp/core`) delivers **2.4x higher throughput** than `axios` with **2.3x lower latency** (p50).
 
 ---
 
@@ -49,28 +68,30 @@ export interface HyperTransport {
 `BunTransport` is designed for Bun, so the project must run in the Bun runtime.
 
 ```bash
-bun install
+bun add @hyperttp/transport-bun
 ```
+
+Peer dependencies: `@hyperttp/types`, `hcacher`.
 
 ---
 
 ## Usage
 
 ```ts
-import { BunTransport } from "./BunTransport";
+import { BunTransport } from "@hyperttp/transport-bun";
 
 const transport = new BunTransport({
+  baseUrl: "https://api.example.com",
   network: {
     timeout: 10_000,
     maxConcurrent: 32,
-    userAgent: "Hyperttp/1.0",
     keepAliveTimeout: 30_000,
     rejectUnauthorized: true,
   },
 });
 
 const response = await transport.execute({
-  url: "https://example.com",
+  url: "/users",
   method: "GET",
   headers: {},
   body: null,
@@ -84,59 +105,96 @@ console.log(await response.text());
 
 ## Configuration
 
-`BunTransport` reads configuration from `HttpClientOptions.network`.
+`BunTransport` accepts a `BunTransportConfig` object:
 
-Supported options:
+```ts
+interface BunTransportConfig extends HttpClientOptions {
+  baseUrl?: string;
+  stealth?: StealthOptions;
+}
+```
+
+### Network options
 
 ```ts
 network?: {
   maxConcurrent?: number;
   timeout?: number;
-  userAgent?: string;
   keepAliveTimeout?: number;
   rejectUnauthorized?: boolean;
+  cookieCache?: {
+    enabled?: boolean;
+    maxSize?: number;
+    ttl?: number;
+  };
+  cache?: {
+    enabled?: boolean;
+    maxSize?: number;
+    ttl?: number;
+  };
 }
 ```
 
-### Option behavior
-
-- `maxConcurrent` — maximum number of concurrent active requests.
-- `timeout` — global request timeout in milliseconds.
-- `userAgent` — injected into `User-Agent` header if not explicitly set.
-- `keepAliveTimeout` — enables `keepalive` mode when provided.
-- `rejectUnauthorized` — passed to Bun `fetch` via `tls` configuration.
+| Option               | Description                                                                                    |
+| -------------------- | ---------------------------------------------------------------------------------------------- |
+| `maxConcurrent`      | Maximum number of concurrent active requests (0 = unlimited)                                   |
+| `timeout`            | Global request timeout in milliseconds (0 = no timeout)                                        |
+| `keepAliveTimeout`   | Enables `keepalive` mode when provided                                                         |
+| `rejectUnauthorized` | Passed to Bun `fetch` via `tls` configuration                                                  |
+| `cookieCache`        | Cookie cache settings: `enabled` (default true), `maxSize` (default 256), `ttl` (default 300s) |
+| `cache`              | Response cache settings for GET/HEAD: `enabled`, `maxSize` (default 256), `ttl` (default 30s)  |
 
 ---
 
 ## Cookies
 
-The transport supports persistent cookie storage and reuse between requests.
+The transport supports persistent cookie storage with TTL and LRU eviction, backed by `hcacher`.
 
 ### How it works
 
-1. When the server returns `Set-Cookie`, cookies are stored per domain.
+1. When the server returns `Set-Cookie`, cookies are stored per domain with a TTL.
 2. On subsequent requests to the same domain, cookies are automatically attached to the `Cookie` header.
 3. If the user provides their own `Cookie` header, it is merged with stored cookies.
+4. Expired entries are evicted automatically (LRU).
 
 ### Example
 
 ```ts
 await transport.execute({
-  url: "https://example.com/login",
+  url: "/login",
   method: "POST",
-  headers: {
-    "Content-Type": "application/json",
-  },
+  headers: { "Content-Type": "application/json" },
   body: JSON.stringify({ login: "demo", password: "secret" }),
 });
 
+// Cookies from /login are automatically sent
 const res = await transport.execute({
-  url: "https://example.com/profile",
+  url: "/profile",
   method: "GET",
   headers: {},
   body: null,
 });
 ```
+
+---
+
+## Response caching
+
+When `network.cache` is configured, GET and HEAD requests are cached automatically with TTL and LRU eviction.
+
+```ts
+const transport = new BunTransport({
+  network: {
+    cache: {
+      enabled: true,
+      maxSize: 512,
+      ttl: 60_000, // 1 minute
+    },
+  },
+});
+```
+
+Cached responses are returned instantly on repeated requests to the same URL within the TTL window.
 
 ---
 
@@ -164,16 +222,45 @@ If a request is aborted, the signal reason (or a default `AbortError`) is thrown
 
 ---
 
+## Stealth / fingerprint mimicry
+
+`BunTransport` supports browser-like TLS fingerprint emulation to bypass fingerprint-based protections (JA3/JA4).
+
+### Supported profiles
+
+| Profile | TLS ciphers   | sec-ch-ua     | User-Agent  |
+| ------- | ------------- | ------------- | ----------- |
+| chrome  | Chrome suite  | Chrome 126    | Chrome 126  |
+| firefox | Firefox suite | Firefox-style | Firefox 126 |
+| safari  | Safari suite  | —             | Safari 17.0 |
+| edge    | Chrome suite  | Chrome 126    | Edge 126    |
+
+### Example
+
+```ts
+const transport = new BunTransport({
+  stealth: {
+    fingerprint: "chrome",
+  },
+});
+```
+
+Stealth presets are applied per-request. Manual headers always take priority over preset values.
+
+---
+
 ## Response API
 
-`BunTransportResponse` wraps the native `Response` and provides:
+`execute()` returns a plain `TransportResponse` object:
 
-- `status`
-- `url`
-- `body`
-- `text()`
-- `json()`
-- `headers`
+```ts
+interface TransportResponse {
+  status: number;
+  url: string;
+  headers: Record<string, string | string[]>;
+  body: TransportResponsePayload | null;
+}
+```
 
 ### Body behavior
 
@@ -185,22 +272,15 @@ If `body` exists, a `dump()` method may be attached to it, allowing safe stream 
 
 ### `fastGetHostname(url: string): string`
 
-Fast hostname extraction from a URL without full parsing.
+Fast hostname extraction from a URL with single-entry LRU cache. Handles `//`, `scheme://`, `user@host`, and port stripping.
 
-### `normalizeHeaderValue(name, value)`
+### `resolveUrl(baseUrl: string, url: string): string`
 
-Normalizes header values:
+Resolves a relative URL against a `baseUrl`. Absolute URLs are returned as-is.
 
-- `Cookie` headers are joined using `;`
-- other arrays are joined using `,`
+### `normalizeHeaders(headers): Record<string, string>`
 
-### `normalizeCookieHeader(value)`
-
-Converts cookie header values into a normalized string.
-
-### `throwIfAborted(signal)`
-
-Checks whether an operation has been aborted and throws if so.
+Normalizes headers: lowercases all keys, joins arrays (`;` for `cookie`, `,` for others).
 
 ---
 
@@ -216,8 +296,10 @@ await transport.destroy();
 Both methods clear:
 
 - pending request queue
-- cookie jar
-- cookie cache
+- cookie store
+- cookie string cache
+- response cache
+- active request counter
 
 ---
 
@@ -226,7 +308,7 @@ Both methods clear:
 - Designed specifically for the **Bun runtime**, not Node.js.
 - Uses `redirect: "manual"` for fetch requests.
 - Minimal interference with request data; only headers, cookies, and signals are normalized or extended.
-- `TransportRequest.body` is treated as `BodyInit | null`.
+- `TransportRequest.body` is passed directly as `BodyInit | null`.
 
 ---
 
