@@ -1,15 +1,9 @@
-import type {
-  HyperTransport,
-  TransportRequest,
-  TransportResponse,
-  TransportResponsePayload,
-  StealthOptions,
-  Fingerprint,
-} from "@hyperttp/types";
-import type { BunTransportConfig } from "./types/index.js";
+import type { HyperTransport, TransportRequest, TransportResponse } from "@hyperttp/types";
+import type { BunTransportConfig, Fingerprint, StealthOptions } from "./types/index.js";
 import {
   fastGetHostname,
   getAbortError,
+  EMPTY_HEADERS,
   normalizeHeaders,
   resolveUrl,
   TIMEOUT_ERROR,
@@ -141,6 +135,12 @@ function applyStealthHeaders(
  * Includes concurrency management, cookie jar, and domain caching.
  */
 export class BunTransport implements HyperTransport {
+  public readonly protocols = ["rest"] as const;
+
+  public supports(protocol: string): boolean {
+    return protocol === "rest";
+  }
+
   /**
    * @ru Конфигурация транспорта.
    * @en Transport configuration.
@@ -158,6 +158,18 @@ export class BunTransport implements HyperTransport {
    * @en Cache of generated cookie strings with TTL.
    */
   private readonly cookieStringCache: CacheManager<string>;
+
+  /**
+   * @ru Наличие cookies в jar. Пока сервер не установил cookie, полностью пропускаем cookie hot path.
+   * @en Whether the jar contains cookies. Skip the cookie hot path until a server sets one.
+   */
+  private hasCookies = false;
+
+  /**
+   * @ru Включено ли cookie-хранилище. При отключении исключаем cookie work из hot path.
+   * @en Whether the cookie store is enabled. When disabled, skip cookie work in the hot path.
+   */
+  private readonly cookiesEnabled: boolean;
 
   /**
    * @ru Опциональный кэш HTTP-ответов для GET/HEAD запросов.
@@ -222,15 +234,16 @@ export class BunTransport implements HyperTransport {
     this.config = config;
 
     const cookieCfg = config?.network?.cookieCache;
+    this.cookiesEnabled = cookieCfg?.enabled ?? true;
     this.cookieStore = new CacheManager<Record<string, string>>({
-      enabled: cookieCfg?.enabled ?? true,
+      enabled: this.cookiesEnabled,
       maxSize: cookieCfg?.maxSize ?? 256,
       ttl: cookieCfg?.ttl ?? 300_000,
       touchOnGet: true,
     });
 
     this.cookieStringCache = new CacheManager<string>({
-      enabled: cookieCfg?.enabled ?? true,
+      enabled: this.cookiesEnabled,
       maxSize: cookieCfg?.maxSize ?? 1024,
       ttl: cookieCfg?.ttl ?? 60_000,
       touchOnGet: true,
@@ -270,7 +283,9 @@ export class BunTransport implements HyperTransport {
    * @returns Promise resolving to the transport response.
    * @throws Error if the request is aborted or times out.
    */
-  public async execute(req: TransportRequest): Promise<TransportResponse> {
+  public async execute(
+    req: TransportRequest & { stealth?: StealthOptions },
+  ): Promise<TransportResponse> {
     const maxConcurrent = this._maxConcurrent;
     const timeoutMs = this._timeout;
 
@@ -331,26 +346,29 @@ export class BunTransport implements HyperTransport {
 
       let headers = normalizeHeaders(req.headers) as Record<string, string>;
 
-      const requestDomain = fastGetHostname(fullUrl);
-      const activeCookies = this.getCookiesForDomain(requestDomain);
-      if (activeCookies.length > 0) {
-        headers["cookie"] = headers["cookie"]
-          ? headers["cookie"] + "; " + activeCookies
-          : activeCookies;
+      if (this.hasCookies) {
+        const activeCookies = this.getCookiesForDomain(fastGetHostname(fullUrl));
+        if (activeCookies.length > 0) {
+          if (headers === EMPTY_HEADERS) headers = Object.create(null);
+          headers["cookie"] = headers["cookie"]
+            ? headers["cookie"] + "; " + activeCookies
+            : activeCookies;
+        }
       }
 
       const stealth =
         req.stealth || this.config.stealth ? { ...this.config.stealth, ...req.stealth } : undefined;
 
       if (stealth) {
+        if (headers === EMPTY_HEADERS) headers = Object.create(null);
         headers = applyStealthHeaders(headers, stealth);
       }
 
       const init: RequestInit & { tls?: unknown } = {
         method: req.method,
         redirect: (req as any).redirect ?? "manual",
-        headers: headers as HeadersInit,
       };
+      if (headers !== EMPTY_HEADERS) init.headers = headers as HeadersInit;
 
       if (req.body !== undefined) init.body = req.body as BodyInit;
       if (signal !== undefined) init.signal = signal;
@@ -373,18 +391,15 @@ export class BunTransport implements HyperTransport {
 
       const bodyStream = nativeRes.body;
 
-      const responseHeaders = (() => {
-        const resH: Record<string, string | string[]> = Object.create(null);
-        nativeRes.headers.forEach((value, key) => {
-          resH[key.toLowerCase()] = value;
-        });
-        return resH;
-      })();
+      const responseHeaders: Record<string, string | string[]> = Object.create(null);
+      nativeRes.headers.forEach((value, key) => {
+        responseHeaders[key] = value;
+      });
 
       const response: TransportResponse = {
         status: nativeRes.status,
         url: nativeRes.url,
-        body: bodyStream as unknown as TransportResponsePayload,
+        body: bodyStream,
         headers: responseHeaders,
       };
 
@@ -456,7 +471,7 @@ export class BunTransport implements HyperTransport {
    * @param headers - Response headers containing Set-Cookie values.
    */
   private storeCookies(requestUrl: string, headers: Headers): void {
-    if (typeof headers.getSetCookie !== "function") return;
+    if (!this.cookiesEnabled || typeof headers.getSetCookie !== "function") return;
 
     const setCookies = headers.getSetCookie();
     if (setCookies.length === 0) return;
@@ -496,6 +511,7 @@ export class BunTransport implements HyperTransport {
       const existing = this.cookieStore.get(domain) ?? Object.create(null);
       existing[name] = value;
       this.cookieStore.set(domain, existing);
+      this.hasCookies = true;
 
       this.cookieStringCache.delete(domain);
     }
@@ -560,6 +576,7 @@ export class BunTransport implements HyperTransport {
     this.queueTail = 0;
     this.cookieStore.clear();
     this.cookieStringCache.clear();
+    this.hasCookies = false;
     this.responseCache?.clear();
     this.activeRequests = 0;
   }

@@ -20,6 +20,8 @@ It wraps native `fetch` and adds:
 
 ```ts
 export interface HyperTransport {
+  readonly protocols?: readonly string[];
+  supports?(protocol: string): boolean;
   execute(req: TransportRequest): Promise<TransportResponse>;
   close?(): Promise<void>;
   destroy?(): Promise<void>;
@@ -41,25 +43,6 @@ export interface HyperTransport {
 - stealth mode: browser-like TLS fingerprint emulation (Chrome, Firefox, Safari, Edge)
 - `baseUrl` support for relative URLs
 - compatibility with `TransportRequest` / `TransportResponse`
-
----
-
-## Benchmark
-
-Benchmark results on **Bun 1.3.14** (20K requests, 200 concurrent, 60s duration):
-
-```text
-Environment: linux 7.1.3-zen2-1-zen | Intel Core i5-8600K @ 3.60GHz
-```
-
-| Rank | Client         | RPS    | Avg      | p50      | p90      | p99      | Errors |
-| ---- | -------------- | ------ | -------- | -------- | -------- | -------- | ------ |
-| 1    | bun-fetch      | 25.92K | 7.65 ms  | 7.69 ms  | 10.41 ms | 14.00 ms | 0      |
-| 2    | undici         | 21.47K | 9.28 ms  | 9.54 ms  | 12.80 ms | 14.77 ms | 0      |
-| 3    | @hyperttp/core | 14.70K | 13.53 ms | 12.03 ms | 17.36 ms | 19.72 ms | 0      |
-| 4    | axios          | 6.24K  | 31.85 ms | 31.83 ms | 33.82 ms | 36.10 ms | 0      |
-
-`BunTransport` (via `@hyperttp/core`) delivers **2.4x higher throughput** than `axios` with **2.3x lower latency** (p50).
 
 ---
 
@@ -93,12 +76,13 @@ const transport = new BunTransport({
 const response = await transport.execute({
   url: "/users",
   method: "GET",
+  protocol: "rest",
   headers: {},
   body: null,
 });
 
 console.log(response.status);
-console.log(await response.text());
+console.log(await new Response(response.body).text());
 ```
 
 ---
@@ -108,7 +92,7 @@ console.log(await response.text());
 `BunTransport` accepts a `BunTransportConfig` object:
 
 ```ts
-interface BunTransportConfig extends HttpClientOptions {
+interface BunTransportConfig {
   baseUrl?: string;
   stealth?: StealthOptions;
 }
@@ -163,6 +147,7 @@ The transport supports persistent cookie storage with TTL and LRU eviction, back
 await transport.execute({
   url: "/login",
   method: "POST",
+  protocol: "rest",
   headers: { "Content-Type": "application/json" },
   body: JSON.stringify({ login: "demo", password: "secret" }),
 });
@@ -171,6 +156,7 @@ await transport.execute({
 const res = await transport.execute({
   url: "/profile",
   method: "GET",
+  protocol: "rest",
   headers: {},
   body: null,
 });
@@ -256,15 +242,16 @@ Stealth presets are applied per-request. Manual headers always take priority ove
 ```ts
 interface TransportResponse {
   status: number;
-  url: string;
-  headers: Record<string, string | string[]>;
-  body: TransportResponsePayload | null;
+  statusText?: string;
+  url?: string;
+  headers: Readonly<Record<string, string | string[]>>;
+  body: unknown;
 }
 ```
 
 ### Body behavior
 
-If `body` exists, a `dump()` method may be attached to it, allowing safe stream consumption and resource cleanup.
+`body` is the raw native `ReadableStream` returned by Bun. Parse or consume it in the core layer, for example with `new Response(response.body).text()`.
 
 ---
 

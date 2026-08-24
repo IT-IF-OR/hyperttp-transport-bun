@@ -99,44 +99,48 @@ export function getAbortError(signal?: AbortSignal): unknown {
   return signal?.reason ?? ABORT_ERROR;
 }
 
+export const EMPTY_HEADERS = Object.freeze(Object.create(null)) as Record<string, string>;
+
 /**
  * @ru Нормализует заголовки, переводя все ключи в нижний регистр (lowercase).
  * @en Normalizes headers by transforming all keys into lowercase layout.
  */
 export function normalizeHeaders(headers: TransportRequest["headers"]): Record<string, string> {
-  if (!headers) return Object.create(null);
-
-  const out: Record<string, string> = Object.create(null);
+  if (!headers) return EMPTY_HEADERS;
 
   if (headers instanceof Headers) {
+    let out: Record<string, string> | undefined;
     headers.forEach((value, key) => {
-      out[key.toLowerCase()] = value;
+      (out ??= Object.create(null))[key.toLowerCase()] = value;
     });
-    return out;
+    return out ?? EMPTY_HEADERS;
   }
 
   if (Array.isArray(headers)) {
+    let out: Record<string, string> | undefined;
     for (let i = 0; i < headers.length; i++) {
       const pair = headers[i] as unknown as [string, string] | undefined;
       if (!pair) continue;
-      out[pair[0].toLowerCase()] = pair[1];
+      (out ??= Object.create(null))[pair[0].toLowerCase()] = pair[1];
     }
-    return out;
+    return out ?? EMPTY_HEADERS;
   }
 
   const src = headers as Record<string, unknown>;
+  let out: Record<string, string> | undefined;
   for (const key in src) {
     const value = src[key];
     if (value == null) continue;
 
     const lowerKey = key.toLowerCase();
+    const target = out ??= Object.create(null);
     if (Array.isArray(value)) {
-      out[lowerKey] = lowerKey === "cookie" ? value.join("; ") : value.join(", ");
+      target[lowerKey] = lowerKey === "cookie" ? value.join("; ") : value.join(", ");
       continue;
     }
 
-    out[lowerKey] = String(value);
+    target[lowerKey] = String(value);
   }
 
-  return out;
+  return out ?? EMPTY_HEADERS;
 }

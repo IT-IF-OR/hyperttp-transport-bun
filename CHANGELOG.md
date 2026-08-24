@@ -4,6 +4,22 @@ All notable changes to this project will be documented in this file.
 
 ---
 
+## [0.3.0] - 2026-08-24
+
+### Added
+
+- Declared support for the `rest` protocol through `protocols` and `supports()` for compatibility with `@hyperttp/core@2`.
+- Added package-owned stealth, fingerprint, cache, and network configuration types.
+- Added a transport-contract test for the raw response body and REST protocol support.
+
+### Changed
+
+- Avoid passing an empty `headers` object to Bun `fetch`; headers are still sent when request headers, cookies, or stealth configuration require them.
+- **Breaking:** aligned with `@hyperttp/types@^0.3.0`; requests require `protocol`, and `execute()` returns the raw response body without transport-level parsing helpers.
+- Reworked English and Russian documentation for the current transport contract.
+
+---
+
 ## [0.2.4] - 2026-07-18
 
 ### Added

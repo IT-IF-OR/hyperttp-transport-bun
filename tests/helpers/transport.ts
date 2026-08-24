@@ -1,5 +1,6 @@
-import { HttpClientOptions, Method, TransportRequest } from "@hyperttp/types";
+import type { TransportRequest } from "@hyperttp/types";
 import { BunTransport } from "../../src/index.js";
+import type { BunTransportConfig } from "../../src/types/index.js";
 
 export const BASE_URL = "http://127.0.0.1:3000";
 export const COOKIE_BASE_URL = "http://localhost:3000";
@@ -9,7 +10,7 @@ type MockFetch = (
   init?: RequestInit | BunFetchRequestInit,
 ) => Promise<Response>;
 
-export const defaultOptions: HttpClientOptions = {
+export const defaultOptions: BunTransportConfig = {
   network: {
     timeout: 5000,
     rejectUnauthorized: true,
@@ -17,19 +18,19 @@ export const defaultOptions: HttpClientOptions = {
 };
 
 export function createTransport(
-  network: HttpClientOptions["network"] = defaultOptions.network,
+  network: BunTransportConfig["network"] = defaultOptions.network,
 ) {
   return new BunTransport({ network });
 }
 
 export function createRequest(
   url: string,
-  method: Method = "GET",
+  method = "GET",
   headers: TransportRequest["headers"] = {},
   body: BodyInit | null = null,
   signal: AbortSignal = new AbortController().signal,
 ): TransportRequest {
-  return { url, method, headers, body, signal };
+  return { url, method, headers, body, signal, protocol: "rest" };
 }
 
 export async function withMockedFetch<T>(
