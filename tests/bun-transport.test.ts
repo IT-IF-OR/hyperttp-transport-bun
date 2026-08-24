@@ -16,7 +16,7 @@ describe("BunTransport", () => {
         headers: { "content-type": "text/plain" },
       }),
     );
-    globalThis.fetch = fetchMock as typeof fetch;
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
 
     const transport = new BunTransport({ baseUrl: "https://api.example.com" });
     const response = await transport.execute({
@@ -36,7 +36,64 @@ describe("BunTransport", () => {
     expect(fetchMock.mock.calls[0]![1]).not.toHaveProperty("headers");
     expect(response.status).toBe(200);
     expect(response.headers["content-type"]).toBe("text/plain");
-    expect(await new Response(response.body).text()).toBe("ok");
+    expect(await new Response(response.body as BodyInit).text()).toBe("ok");
+  });
+
+  it("bypasses the response cache for stream requests", async () => {
+    const firstResponse = new Response("first");
+    const secondResponse = new Response("second");
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(firstResponse)
+      .mockResolvedValueOnce(secondResponse);
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+
+    const transport = new BunTransport({
+      baseUrl: "https://api.example.com",
+      network: { cache: { maxSize: 1 } },
+    });
+    const request = {
+      url: "/audio.mp3",
+      method: "GET",
+      headers: {},
+      protocol: "rest" as const,
+      stream: true,
+    };
+
+    const first = await transport.execute(request);
+    const second = await transport.execute(request);
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(first.body).toBe(firstResponse.body);
+    expect(second.body).toBe(secondResponse.body);
+  });
+
+  it("does not cache native response bodies for ordinary requests", async () => {
+    const firstResponse = new Response("first");
+    const secondResponse = new Response("second");
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(firstResponse)
+      .mockResolvedValueOnce(secondResponse);
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+
+    const transport = new BunTransport({
+      baseUrl: "https://api.example.com",
+      network: { cache: { maxSize: 1 } },
+    });
+    const request = {
+      url: "/response-with-body",
+      method: "GET",
+      headers: {},
+      protocol: "rest" as const,
+    };
+
+    const first = await transport.execute(request);
+    const second = await transport.execute(request);
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(first.body).toBe(firstResponse.body);
+    expect(second.body).toBe(secondResponse.body);
   });
 
   it("skips cookie lookups until a response sets a cookie", async () => {
@@ -46,7 +103,7 @@ describe("BunTransport", () => {
         headers: { "content-type": "text/plain" },
       }),
     );
-    globalThis.fetch = fetchMock as typeof fetch;
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
 
     const transport = new BunTransport({ baseUrl: "https://api.example.com" });
     const getCookiesForDomain = vi.spyOn(transport as any, "getCookiesForDomain");
@@ -75,7 +132,7 @@ describe("BunTransport", () => {
       headers,
     } as Response;
     const fetchMock = vi.fn().mockResolvedValue(response);
-    globalThis.fetch = fetchMock as typeof fetch;
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
 
     const transport = new BunTransport({ baseUrl: "https://api.example.com" });
     await transport.execute({ url: "/login", method: "POST", headers: {}, protocol: "rest" });

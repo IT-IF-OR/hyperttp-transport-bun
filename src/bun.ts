@@ -284,7 +284,7 @@ export class BunTransport implements HyperTransport {
    * @throws Error if the request is aborted or times out.
    */
   public async execute(
-    req: TransportRequest & { stealth?: StealthOptions },
+    req: TransportRequest & { stealth?: StealthOptions; stream?: boolean },
   ): Promise<TransportResponse> {
     const maxConcurrent = this._maxConcurrent;
     const timeoutMs = this._timeout;
@@ -336,7 +336,12 @@ export class BunTransport implements HyperTransport {
     try {
       const fullUrl = resolveUrl(this.config?.baseUrl ?? "", req.url);
 
-      if (this.responseCache && (req.method === "GET" || req.method === "HEAD") && !req.body) {
+      if (
+        this.responseCache &&
+        !req.stream &&
+        (req.method === "GET" || req.method === "HEAD") &&
+        !req.body
+      ) {
         const cacheKey = `${req.method}:${fullUrl}`;
         const cached = this.responseCache.get(cacheKey);
         if (cached !== undefined) {
@@ -403,7 +408,13 @@ export class BunTransport implements HyperTransport {
         headers: responseHeaders,
       };
 
-      if (this.responseCache && (req.method === "GET" || req.method === "HEAD") && !req.body) {
+      if (
+        this.responseCache &&
+        !req.stream &&
+        (req.method === "GET" || req.method === "HEAD") &&
+        !req.body &&
+        bodyStream === null
+      ) {
         const cacheKey = `${req.method}:${fullUrl}`;
         this.responseCache.set(cacheKey, response);
       }
