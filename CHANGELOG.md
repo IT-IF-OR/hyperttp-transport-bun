@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 ---
 
+## [0.3.2] - 2026-08-27
+
+### Changed
+
+- Updated peer dependencies to`hcacher@^0.3.0`.
+
 ## [0.3.1] - 2026-08-24
 
 ### Fixed

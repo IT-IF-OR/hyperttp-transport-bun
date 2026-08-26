@@ -1,6 +1,6 @@
 {
   "name": "@hyperttp/transport-bun",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "description": "High-performance HTTP transport for Bun with native fetch optimizations",
   "type": "module",
   "sideEffects": false,
@@ -31,7 +31,7 @@
   },
   "peerDependencies": {
     "@hyperttp/types": "^0.3.0",
-    "hcacher": "^0.2.0"
+    "hcacher": "^0.3.0"
   },
   "devDependencies": {
     "@dirold2/dev-tools": "^1.1.3",
