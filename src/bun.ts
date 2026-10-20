@@ -1,4 +1,10 @@
-import type { HyperTransport, TransportRequest, TransportResponse } from "@hyperttp/types";
+import type {
+  HyperTransport,
+  TransportListenOptions,
+  TransportRequest,
+  TransportResponse,
+  TransportServer,
+} from "@hyperttp/types";
 import type { BunTransportConfig, Fingerprint, StealthOptions } from "./types/index.js";
 import {
   fastGetHostname,
@@ -147,6 +153,8 @@ export class BunTransport implements HyperTransport {
    */
   public config: BunTransportConfig;
 
+  private readonly servers = new Set<(force?: boolean) => Promise<void>>();
+
   /**
    * @ru Кэш cookies по доменам с TTL и LRU-эвикцией (domain -> name -> value).
    * @en Cookie cache by domain with TTL and LRU eviction (domain -> name -> value).
@@ -263,6 +271,66 @@ export class BunTransport implements HyperTransport {
   }
 
   /**
+   * @ru Принимает HTTP-запросы через Bun.serve без разбора тела.
+   * @en Accepts HTTP requests through Bun.serve without parsing the body.
+   */
+  public async listen(options: TransportListenOptions): Promise<TransportServer> {
+    const { signal, onRequest } = options;
+    if (signal?.aborted) throw getAbortError(signal);
+
+    const server = Bun.serve({
+      hostname: options.host,
+      port: options.port,
+      fetch: async (request) => {
+        if (!onRequest) return new Response(null, { status: 503 });
+
+        const response = await onRequest({
+          method: request.method,
+          url: request.url,
+          headers: Object.fromEntries(request.headers),
+          body: request.body,
+          signal: request.signal,
+          protocol: "rest",
+        });
+        const headers = new Headers();
+        for (const [name, value] of Object.entries(response.headers)) {
+          if (Array.isArray(value)) {
+            for (const item of value) headers.append(name, item);
+          } else {
+            headers.set(name, value);
+          }
+        }
+
+        return new Response(response.body as BodyInit | null | undefined, {
+          status: response.status,
+          statusText: response.statusText,
+          headers,
+        });
+      },
+    });
+
+    const stop = async (force = false): Promise<void> => {
+      try {
+        await server.stop(force);
+      } finally {
+        signal?.removeEventListener("abort", onAbort);
+        this.servers.delete(stop);
+      }
+    };
+    const onAbort = (): void => {
+      void stop(true).catch(() => {});
+    };
+    this.servers.add(stop);
+    signal?.addEventListener("abort", onAbort, { once: true });
+    if (signal?.aborted) {
+      await stop(true);
+      throw getAbortError(signal);
+    }
+
+    return { close: () => stop() };
+  }
+
+  /**
    * @ru Обновляет внутреннее состояние на основе конфигурации.
    * Вызывается при создании и может быть вызвано при изменении конфига.
    * @en Updates internal state based on configuration.
@@ -321,12 +389,14 @@ export class BunTransport implements HyperTransport {
         await this.waitForSlot(signal);
       } catch (err) {
         if (timer !== null) clearTimeout(timer);
-        if (originalSignal && abortHandler) originalSignal.removeEventListener("abort", abortHandler);
+        if (originalSignal && abortHandler)
+          originalSignal.removeEventListener("abort", abortHandler);
         throw err;
       }
       if (signal?.aborted) {
         if (timer !== null) clearTimeout(timer);
-        if (originalSignal && abortHandler) originalSignal.removeEventListener("abort", abortHandler);
+        if (originalSignal && abortHandler)
+          originalSignal.removeEventListener("abort", abortHandler);
         throw getAbortError(signal);
       }
     }
@@ -582,6 +652,7 @@ export class BunTransport implements HyperTransport {
    * @returns Promise that resolves when cleanup is complete.
    */
   public async close(): Promise<void> {
+    await Promise.all(Array.from(this.servers, (stop) => stop()));
     this.concurrencyQueue = Object.create(null);
     this.queueHead = 0;
     this.queueTail = 0;
@@ -593,11 +664,12 @@ export class BunTransport implements HyperTransport {
   }
 
   /**
-   * @ru Принудительно уничтожает транспорт (алиас для close()).
-   * @en Forcefully destroys the transport (alias for close()).
+   * @ru Принудительно останавливает серверы и освобождает ресурсы транспорта.
+   * @en Forcefully stops servers and releases transport resources.
    * @returns Promise that resolves when cleanup is complete.
    */
   public async destroy(): Promise<void> {
+    await Promise.all(Array.from(this.servers, (stop) => stop(true)));
     await this.close();
   }
 }

@@ -6,6 +6,115 @@ const originalFetch = globalThis.fetch;
 
 afterEach(() => {
   globalThis.fetch = originalFetch;
+  vi.unstubAllGlobals();
+});
+
+describe("BunTransport.listen", () => {
+  function mockServer() {
+    const stop = vi.fn().mockResolvedValue(undefined);
+    const serve = vi.fn().mockReturnValue({ stop });
+    vi.stubGlobal("Bun", { serve });
+    return { serve, stop };
+  }
+
+  it("passes raw requests and preserves response streams and repeated headers", async () => {
+    const { serve, stop } = mockServer();
+    const body = new Response("response").body;
+    const onRequest = vi.fn().mockResolvedValue({
+      status: 201,
+      statusText: "Created",
+      headers: { "set-cookie": ["a=1; Path=/", "b=2; Path=/"] },
+      body,
+    });
+    const transport = new BunTransport({});
+    const server = await transport.listen({ host: "127.0.0.1", port: 8080, onRequest });
+    const options = serve.mock.calls[0]![0];
+    expect(options).toMatchObject({ hostname: "127.0.0.1", port: 8080 });
+
+    const request = new Request("http://localhost/upload", {
+      method: "POST",
+      headers: { "content-type": "text/plain" },
+      body: "request",
+    });
+    const response = await options.fetch(request);
+    expect(onRequest).toHaveBeenCalledWith({
+      method: "POST",
+      url: request.url,
+      headers: { "content-type": "text/plain" },
+      body: request.body,
+      signal: request.signal,
+      protocol: "rest",
+    });
+    expect(response.status).toBe(201);
+    expect(response.statusText).toBe("Created");
+    expect(response.body).toBe(body);
+    expect(response.headers.getSetCookie()).toEqual(["a=1; Path=/", "b=2; Path=/"]);
+    expect(await response.text()).toBe("response");
+    await server.close();
+    expect(stop).toHaveBeenCalledWith(false);
+    await transport.close();
+    expect(stop).toHaveBeenCalledTimes(1);
+  });
+
+  it("rejects incoming requests when onRequest is omitted", async () => {
+    const { serve } = mockServer();
+    const transport = new BunTransport({});
+    await transport.listen({ port: 8080 });
+    const response = await serve.mock.calls[0]![0].fetch(new Request("http://localhost/"));
+    expect(response.status).toBe(503);
+    await transport.close();
+  });
+
+  it("does not start a server for an already aborted signal", async () => {
+    const { serve } = mockServer();
+    const transport = new BunTransport({});
+    await expect(transport.listen({ signal: AbortSignal.abort() })).rejects.toThrow();
+    expect(serve).not.toHaveBeenCalled();
+    await transport.close();
+  });
+
+  it("stops the server when the signal is aborted", async () => {
+    const { stop } = mockServer();
+    const controller = new AbortController();
+    const transport = new BunTransport({});
+    await transport.listen({ signal: controller.signal });
+    controller.abort();
+    expect(stop).toHaveBeenCalledWith(true);
+    await vi.waitFor(() => expect((transport as any).servers.size).toBe(0));
+    await transport.close();
+    expect(stop).toHaveBeenCalledTimes(1);
+  });
+
+  it("gracefully closes all servers and removes abort listeners", async () => {
+    const { stop } = mockServer();
+    const controller = new AbortController();
+    const transport = new BunTransport({});
+    await transport.listen({ port: 8080, signal: controller.signal });
+    await transport.listen({ port: 8081 });
+    await transport.close();
+    expect(stop).toHaveBeenCalledTimes(2);
+    expect(stop).toHaveBeenCalledWith(false);
+    controller.abort();
+    expect(stop).toHaveBeenCalledTimes(2);
+  });
+
+  it("forcefully stops servers on destroy", async () => {
+    const { stop } = mockServer();
+    const transport = new BunTransport({});
+    await transport.listen({});
+    await transport.destroy();
+    expect(stop).toHaveBeenCalledExactlyOnceWith(true);
+  });
+
+  it("propagates server startup errors", async () => {
+    const { serve } = mockServer();
+    serve.mockImplementation(() => {
+      throw new Error("Address in use");
+    });
+    const transport = new BunTransport({});
+    await expect(transport.listen({ port: 8080 })).rejects.toThrow("Address in use");
+    await transport.close();
+  });
 });
 
 describe("BunTransport", () => {

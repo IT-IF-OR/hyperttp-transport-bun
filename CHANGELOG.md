@@ -4,6 +4,22 @@ All notable changes to this project will be documented in this file.
 
 ---
 
+## [0.4.0] - 2026-10-20
+
+### Added
+
+- Implemented `listen(options)` via `Bun.serve`, following the `TransportListenOptions` / `TransportServer` contract.
+- Added support for server host, port, abort signals, and raw request handling through `onRequest`, with streaming bodies and repeated response headers preserved.
+- Return HTTP 503 when no `onRequest` handler is provided.
+- Added seven server transport tests and an HTTP server usage example in the README.
+
+### Changed
+
+- `close()` now gracefully stops all servers started by the transport; `destroy()` forcefully closes their active connections.
+- Individual servers can be stopped gracefully through the returned `TransportServer.close()` method.
+
+---
+
 ## [0.3.2] - 2026-08-27
 
 ### Changed

@@ -23,6 +23,7 @@ export interface HyperTransport {
   readonly protocols?: readonly string[];
   supports?(protocol: string): boolean;
   execute(req: TransportRequest): Promise<TransportResponse>;
+  listen?(options: TransportListenOptions): Promise<TransportServer>;
   close?(): Promise<void>;
   destroy?(): Promise<void>;
 }
@@ -57,6 +58,33 @@ bun add @hyperttp/transport-bun
 Peer dependencies: `@hyperttp/types`, `hcacher`.
 
 ---
+
+## HTTP server
+
+```ts
+import { BunTransport } from "@hyperttp/transport-bun";
+
+const transport = new BunTransport({});
+const server = await transport.listen({
+  host: "127.0.0.1",
+  port: 3000,
+  onRequest(request) {
+    return {
+      status: 200,
+      headers: { "content-type": "text/plain" },
+      body: "Hello from Bun!",
+    };
+  },
+});
+
+await server.close();
+```
+
+`listen` uses `Bun.serve` and passes incoming bodies as raw `ReadableStream`s.
+Without `onRequest`, requests receive HTTP 503. An optional `signal` stops the
+server when aborted. `server.close()` stops one server gracefully;
+`transport.close()` stops all its servers gracefully, while `transport.destroy()`
+forcefully closes active connections.
 
 ## Usage
 
