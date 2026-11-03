@@ -1,7 +1,21 @@
 {
   "name": "@hyperttp/transport-bun",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "description": "High-performance HTTP transport for Bun with native fetch optimizations",
+  "keywords": [
+    "bun",
+    "fetch",
+    "high-performance",
+    "http",
+    "hyperttp",
+    "transport"
+  ],
+  "license": "MIT",
+  "author": "dirold2",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/IT-IF-OR/hyperttp-transport-bun.git"
+  },
   "type": "module",
   "sideEffects": false,
   "main": "./index.js",
@@ -12,23 +26,9 @@
       "import": "./index.js"
     }
   },
-  "keywords": [
-    "http",
-    "transport",
-    "high-performance",
-    "fetch",
-    "bun",
-    "hyperttp"
-  ],
-  "author": "dirold2",
-  "license": "MIT",
-  "repository": {
-    "type": "git",
-    "url": "git+https://github.com/IT-IF-OR/hyperttp-transport-bun.git"
-  },
   "peerDependencies": {
-    "@hyperttp/types": "^0.4.2",
+    "@hyperttp/types": "^0.5.3",
     "hcacher": "^0.3.0"
   },
-  "private": false
+  "private": true
 }

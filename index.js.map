@@ -1,1 +1,7 @@
-{"version":3,"file":"index.js","sourceRoot":"","sources":["../src/index.ts"],"names":[],"mappings":"AAAA,OAAO,EAAE,YAAY,EAAE,MAAM,UAAU,CAAC"}
+{
+  "version": 3,
+  "sources": ["../src/index.ts"],
+  "sourcesContent": ["export { BunTransport } from \"./bun.js\";\n"],
+  "mappings": "AAAA,OAAS,gBAAAA,MAAoB",
+  "names": ["BunTransport"]
+}
