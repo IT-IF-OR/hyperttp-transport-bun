@@ -17,9 +17,7 @@ export const defaultOptions: BunTransportConfig = {
   },
 };
 
-export function createTransport(
-  network: BunTransportConfig["network"] = defaultOptions.network,
-) {
+export function createTransport(network: BunTransportConfig["network"] = defaultOptions.network) {
   return new BunTransport({ network });
 }
 
@@ -33,10 +31,7 @@ export function createRequest(
   return { url, method, headers, body, signal, protocol: "rest" };
 }
 
-export async function withMockedFetch<T>(
-  impl: MockFetch,
-  fn: () => Promise<T>,
-): Promise<T> {
+export async function withMockedFetch<T>(impl: MockFetch, fn: () => Promise<T>): Promise<T> {
   const originalFetch = globalThis.fetch;
 
   globalThis.fetch = impl as unknown as typeof fetch;
