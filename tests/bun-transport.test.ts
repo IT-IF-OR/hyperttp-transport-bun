@@ -17,6 +17,14 @@ describe("BunTransport.listen", () => {
     return { serve, stop };
   }
 
+  it("enables HTTP/2 from the top-level transport option", async () => {
+    const { serve } = mockServer();
+    const transport = new BunTransport({ http2: true });
+    await transport.listen({ port: 8080 });
+    expect(serve).toHaveBeenCalledWith(expect.objectContaining({ http2: true }));
+    await transport.close();
+  });
+
   it("passes raw requests and preserves response streams and repeated headers", async () => {
     const { serve, stop } = mockServer();
     const body = new Response("response").body;

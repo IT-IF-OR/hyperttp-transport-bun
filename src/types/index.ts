@@ -17,6 +17,13 @@ export interface CacheOptions {
  */
 export interface BunTransportConfig {
   /**
+   * Enables HTTP/2 for Bun.serve when the runtime supports it. This only
+   * applies to REST: Bun.serve Response objects cannot emit gRPC trailers.
+   * Use `@hyperttp/transport-node`'s Http2Transport for gRPC on Bun.
+   */
+  http2?: boolean;
+
+  /**
    * @ru Базовый URL для всех запросов.
    * @en Base URL for all requests.
    */
@@ -29,6 +36,12 @@ export interface BunTransportConfig {
   stealth?: StealthOptions;
 
   network?: {
+    /**
+     * Enables HTTP/2 for Bun.serve when the runtime supports it. This only
+     * applies to REST: Bun.serve Response objects cannot emit gRPC trailers.
+     * Use `@hyperttp/transport-node`'s Http2Transport for gRPC on Bun.
+     */
+    http2?: boolean;
     timeout?: number;
     maxConcurrent?: number;
     keepAliveTimeout?: number;

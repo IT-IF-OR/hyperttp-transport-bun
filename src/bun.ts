@@ -278,7 +278,9 @@ export class BunTransport implements HyperTransport {
     const { signal, onRequest } = options;
     if (signal?.aborted) throw getAbortError(signal);
 
+    const http2 = this.config.network?.http2 ?? this.config.http2;
     const server = Bun.serve({
+      ...(http2 !== undefined ? { http2 } : {}),
       hostname: options.host,
       port: options.port,
       fetch: async (request) => {

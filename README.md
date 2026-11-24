@@ -86,6 +86,30 @@ server when aborted. `server.close()` stops one server gracefully;
 `transport.close()` stops all its servers gracefully, while `transport.destroy()`
 forcefully closes active connections.
 
+## HTTP/2 and gRPC
+
+For a standalone REST listener, `http2: true` is passed to `Bun.serve`:
+
+```ts
+const transport = new BunTransport({ http2: true });
+```
+
+With TLS, Bun negotiates HTTP/2 through ALPN. Without TLS, clients must connect
+with HTTP/2 prior knowledge. This native Bun path is REST-only: Bun cannot send
+the response trailers required by gRPC.
+
+When `@hyperttp/core` or `hyperttp` resolves a gRPC listener, or one shared by
+REST and gRPC, it selects `Http2Transport` from `@hyperttp/transport-node` even
+on Bun. Install it alongside this package:
+
+```bash
+bun add @hyperttp/transport-node
+```
+
+That transport uses Bun's `node:http2` compatibility layer and supports REST and
+gRPC on the same HTTP/2 listener, including gRPC trailers. `BunTransport` remains
+the native choice for REST-only listeners.
+
 ## Usage
 
 ```ts

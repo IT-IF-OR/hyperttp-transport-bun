@@ -4,6 +4,15 @@ All notable changes to this project will be documented in this file.
 
 ---
 
+## [0.4.3] - 2026-11-24
+
+### Added
+
+- Added the `http2` client-option declaration when the Bun transport entry point is imported.
+- `http2: true` now selects native `BunTransport` for REST traffic; gRPC and shared REST + gRPC still use the Node HTTP/2 transport.
+
+---
+
 ## [0.4.0] - 2026-10-20
 
 ### Added

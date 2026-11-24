@@ -56,6 +56,30 @@ bun add @hyperttp/transport-bun
 
 Зависимости: `@hyperttp/types`, `hcacher`.
 
+## HTTP/2 и gRPC
+
+Для отдельного REST-слушателя `http2: true` передаётся в `Bun.serve`:
+
+```ts
+const transport = new BunTransport({ http2: true });
+```
+
+С TLS Bun согласует HTTP/2 через ALPN. Без TLS клиент должен подключаться с
+HTTP/2 prior knowledge. Нативный путь Bun поддерживает только REST: Bun не
+умеет отправлять response trailers, необходимые gRPC.
+
+Когда `@hyperttp/core` или `hyperttp` разрешает gRPC-слушатель либо общий
+слушатель REST и gRPC, даже в Bun выбирается `Http2Transport` из
+`@hyperttp/transport-node`. Установите его вместе с этим пакетом:
+
+```bash
+bun add @hyperttp/transport-node
+```
+
+Этот транспорт использует слой совместимости Bun `node:http2` и поддерживает
+REST и gRPC на одном HTTP/2-слушателе, включая gRPC trailers. Для REST-only
+слушателей нативным выбором остаётся `BunTransport`.
+
 ---
 
 ## Использование
